@@ -15,10 +15,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 import pytest
 
-pytest.importorskip("PySide6")
 pytestmark = pytest.mark.qt
 
-from PySide6.QtWidgets import QApplication
+try:
+    from PySide6.QtWidgets import QApplication
+except ImportError as error:        # PySide6 absent, or a system library (libEGL, ...) missing
+    pytest.skip(f"Qt is not usable here: {error}", allow_module_level=True)
 
 from anyfatigue import examples, stress_io
 from anyfatigue.errors import InputError

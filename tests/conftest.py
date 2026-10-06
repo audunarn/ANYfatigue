@@ -58,7 +58,7 @@ def _importable(name: str) -> bool:
 
 
 HAVE_ANYFEM = _importable("anyfem") and _importable("anysolver") and _importable("h5py")
-HAVE_QT = _importable("PySide6")
+HAVE_QT = _importable("PySide6.QtWidgets")
 
 
 def pytest_collection_modifyitems(config, items):

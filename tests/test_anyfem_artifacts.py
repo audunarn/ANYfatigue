@@ -297,9 +297,11 @@ def test_cli_runs_an_analysis_on_a_project(saved, artifact, tmp_path, capsys):
 @pytest.mark.qt
 def test_gui_opens_an_anyfem_result(saved):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    pytest.importorskip("PySide6")
-    from PySide6.QtWidgets import QApplication
-    from anyfatigue.gui.window import MainWindow
+    try:
+        from PySide6.QtWidgets import QApplication
+        from anyfatigue.gui.window import MainWindow
+    except ImportError as error:
+        pytest.skip(f"Qt is not usable here: {error}")
 
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
