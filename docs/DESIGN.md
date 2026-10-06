@@ -107,6 +107,7 @@ References that are independent of the code under test:
   point read-out, weld resolution, bilinear weights, half-cycle counts, mean-stress factor). All are caught.
   Two gaps found and closed while doing this (a hot-spot side test that could not see the sign because a
   linear field extrapolates exactly; a quadratic field is even in the offset, so a cubic is needed).
+* **CI**: green on Ubuntu and Windows, Python 3.11 to 3.14 (core, extraction, both methods, files, GUI).
 * **Installed wheel** built offline, installed outside the source tree, imported and run (analysis + CLI).
 * **GUI**: offscreen tests check that what the forms collect equals what the library computes and that the
   window shows the same damage; plots were inspected visually (real fonts) and two layout defects fixed.
@@ -147,9 +148,11 @@ ANYfem adapter: extraction is cheap; patch recovery (ANYsolver) is about 2 s per
    that covers only part of the shell elements is refused. Normals follow `physical_director`; without it
    (older files) they follow the corner order and the sign of the hot-spot `side` can differ per element,
    so give an explicit read-out direction.
-5. CI (`.github/workflows/tests.yml`) is written but has not been run; it covers the core and Qt tests. The
-   ANYfem integration tests need the ANYfem stack, which ANYfem's own CI pins by commit, so they are not
-   in this workflow yet.
+5. CI (`.github/workflows/tests.yml`): first run on GitHub (2026-10-06) failed on Ubuntu because PySide6 needs
+   `libEGL.so.1` there; fixed (system libraries installed, GUI tests skip with a reason when Qt cannot
+   load). Second run is **green on all 8 jobs** (Ubuntu and Windows, Python 3.11 to 3.14): 319 passed,
+   32 skipped on Ubuntu, the 32 being the ANYfem-dependent tests. Those need the ANYfem stack, which
+   ANYfem's own CI pins by commit, so they are not in this workflow yet and run on workstations only.
 6. No release, tag or publication.
 7. GUI: no cancel for a running job, no mesh view of the damage, patch recovery cost can be minutes on large models.
-8. Unverified here: behaviour on Linux and macOS (only Windows was run).
+8. macOS has not been run. Linux is covered by CI for everything except the ANYfem-dependent tests.
