@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.pytest_tmp*/
+.idea/
+.venv/
+venv/
+reports/
+*.anyfatigue-out/
+# Copyrighted reference documents (e.g. the DNV-RP-C203 PDF) are read locally, never committed
+docs/reference/
