@@ -9,8 +9,9 @@ from typing import Dict, Mapping, Optional, Tuple
 import numpy as np
 
 from .rainflow import CycleTable
+from .sn_curves import SNCurve
 
-__all__ = ["AssessmentResult", "PartResult", "PointResult"]
+__all__ = ["AssessmentResult", "DirectionResult", "PartResult", "PointResult"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,19 @@ class PartResult:
     cycles: Optional[CycleTable] = None
     series: Optional[np.ndarray] = None
     series_times: Optional[np.ndarray] = None
+    # Raw cycles retain NORMAL ranges/means; these are the ranges used for damage.
+    equivalent_ranges: Optional[np.ndarray] = None
+    curve: Optional[SNCurve] = None
+
+
+@dataclass(frozen=True)
+class DirectionResult:
+    """Summary on one fixed plane; block damages follow the settings' block order."""
+
+    angle_deg: float
+    curve: SNCurve
+    damage: float
+    block_damages: Tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,12 @@ class PointResult:
     passed: bool
     parts: Tuple[PartResult, ...]
     notes: str = ""
+    directions: Tuple[DirectionResult, ...] = ()
+    normal_to_weld_damage: Optional[float] = None
+
+    @property
+    def critical_angle_deg(self) -> Optional[float]:
+        return max(self.directions, key=lambda d: d.damage).angle_deg if self.directions else None
 
     @property
     def life_text(self) -> str:

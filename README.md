@@ -83,6 +83,26 @@ result = AnalysisDefinition("time_series", settings, (weld,)).run(source)
 print(result.critical.label, result.critical.damage, result.critical.usage)
 ```
 
+### Rotating stress directions at shell hot spots
+
+Time-series assessments now accept an explicit `MultidirectionalSettings` option.
+It resolves the full surface tensor onto fixed material planes, counts the signed
+normal history through ANYtimeseries, and combines each counted range with that
+plane's **whole-block shear range**. Damage is accumulated across blocks on each
+plane before selecting the governing plane. The weld-normal baseline, directional
+curves, all directional damage totals and governing angle are retained in results.
+
+Both existing read-outs work unchanged: `hotspot_b` at 0.5t with a
+**detail-appropriate E curve**, or component-wise `hotspot_a` extrapolation with D.
+There is no automatic curve reassignment or additional 1.12 multiplier.
+
+This is an opt-in **2019/2020 F.12 method subset**, not current-edition DNV
+qualification. Gamma and the basis for directional curve assignments must be
+supplied explicitly. Exact time-matched shear cycles and F.12.1 crack-sector
+accumulation are not implemented. The Python API and saved-definition CLI support
+it; the GUI rejects these definitions rather than silently losing the settings.
+See [the algorithm, runnable example and verification record](docs/MULTIDIRECTIONAL.md).
+
 Simplified method: `SimplifiedSettings(..., n0=1e4, conditions=(LoadCondition("loaded", "case_name", weibull_h=0.8, period_s=9.0),))`
 with `assess_simplified`. An analysis is saved and re-run with
 `AnalysisDefinition.save/load`; reports with `anyfatigue.report`.

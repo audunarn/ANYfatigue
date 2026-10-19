@@ -46,12 +46,13 @@ def design_life_spectrum(
     """``(cycles at or above, effective range)`` over the design life, or None."""
 
     s = result.settings
-    curve = SNCurve.from_dict(s["curve"])
+    curve = part.curve or SNCurve.from_dict(s["curve"])
     scf, thickness = s["scf"], s["thickness_mm"]
     if result.method == "time_series":
         if part.cycles is None or len(part.cycles) == 0:
             return None
-        eff = np.asarray(curve.effective_range(part.cycles.ranges, scf=scf, thickness_mm=thickness))
+        ranges = part.equivalent_ranges if part.equivalent_ranges is not None else part.cycles.ranges
+        eff = np.asarray(curve.effective_range(ranges, scf=scf, thickness_mm=thickness))
         order = np.argsort(-eff)
         counts = part.cycles.counts[order] * part.values["exposure_scale"]
         return np.cumsum(counts), eff[order]

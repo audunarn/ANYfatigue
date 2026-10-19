@@ -279,3 +279,16 @@ def test_run_gui_launcher_is_importable_and_smoke_starts(app):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.main(["--example", "synthetic", "--smoke"]) == 0
+
+
+def test_multidirectional_definition_is_rejected_before_mutating_scalar_forms(window, synthetic):
+    from dataclasses import replace
+    from anyfatigue import MultidirectionalSettings
+
+    _source, original = load(window, synthetic)
+    md = MultidirectionalSettings.uniform(original.settings.curve, gamma=1.0,
+                                         gamma_basis="test", curve_basis="test")
+    new = replace(original, settings=replace(original.settings, multidirectional=md))
+    with pytest.raises(InputError, match="Python API or CLI"):
+        window.set_definition(new)
+    assert window.collect_definition() == original
