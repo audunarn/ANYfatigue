@@ -1,0 +1,29 @@
+name: multidirectional development snapshot
+on:
+  push:
+    branches: [feat/multidirectional-shell-fatigue]
+    paths:
+      - .github/workflows/multidirectional-dev.yml
+permissions:
+  contents: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Export public source and published rainflow dependency
+        run: |
+          mkdir snapshot
+          git archive --format=zip HEAD -o snapshot/ANYfatigue-source.zip
+          python -m pip download --no-deps anytimes -d snapshot
+          git rev-parse HEAD > snapshot/SOURCE_COMMIT.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multidirectional-development-source
+          path: snapshot/
+          retention-days: 3
