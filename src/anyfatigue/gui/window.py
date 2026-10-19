@@ -669,6 +669,11 @@ class MainWindow(QMainWindow):
     def set_definition(self, definition: AnalysisDefinition) -> None:
         """Fill every form from a definition."""
 
+        if getattr(definition.settings, "multidirectional", None) is not None:
+            raise InputError(
+                "Multidirectional definitions require the Python API or CLI; the GUI "
+                "cannot edit them without losing directional settings."
+            )
         self._building = True
         try:
             self._name = definition.name

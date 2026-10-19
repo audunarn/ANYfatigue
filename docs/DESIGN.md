@@ -1,6 +1,9 @@
 # ANYfatigue: design record and verification evidence
 
-Living task note for 0.1.0 (2026-10-06). Policy: `ANY_ECOSYSTEM_RISK_PROPORTIONATE_ENGINEERING_V1`,
+Historical task note for 0.1.0 (2026-10-06). The later opt-in multidirectional
+implementation has its own living record in [MULTIDIRECTIONAL.md](MULTIDIRECTIONAL.md).
+The verification evidence below remains scoped to its original revision.
+ Policy: `ANY_ECOSYSTEM_RISK_PROPORTIONATE_ENGINEERING_V1`,
 revision `2026-09-24.2`. Level A (integrated development) with focused checks; no release,
 qualification or publication claim is made.
 
@@ -140,8 +143,9 @@ ANYfem adapter: extraction is cheap; patch recovery (ANYsolver) is about 2 s per
    `STANDARD_EDITION` updated, with the 2010 values kept selectable if they differ.
 2. Not implemented: beam elements, nonlinear or transient results, the second-order stress fit for
    coarse 4-node shell meshes (4.3.3), welds' mean-stress/residual-stress treatment, tubular-joint SCF
-   methods, crack-growth assessment, non-proportional multiaxial counting (the principal measure can
-   switch branch).
+   methods and crack-growth assessment. Exact time-matched multiaxial counting remains absent;
+   the later normal-master/global-shear-range option is documented in MULTIDIRECTIONAL.md.
+   The legacy principal measure can still switch branch and is not used by the new option.
 3. A time-series record is treated as non-repeating; a repeating record should be closed by the user.
 4. ANYfem results are read in-process, from saved projects (`.anyres.h5`, lazily) or via an exported `.npz`.
    The reader needs the project's `meshes/` folder and global surface stresses in the result; a result

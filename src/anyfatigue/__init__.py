@@ -20,12 +20,15 @@ from .errors import (
     UnsupportedInputError,
 )
 from .sn_curves import SNCurve, get_curve
+from .multidirectional import FatiguePlane, MultidirectionalSettings
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ExtractionError",
     "FatigueError",
+    "FatiguePlane",
+    "MultidirectionalSettings",
     "InputError",
     "MissingDependencyError",
     "SNCurve",

@@ -23,7 +23,7 @@ first sample) so that its half cycles pair up.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -34,6 +34,10 @@ from .errors import InputError
 from .extract import SamplePoint, extract
 from .measures import StressMeasure
 from .model import StressSource
+from .multidirectional import (
+    METHOD_ID, METHOD_SOURCE, METHOD_WARNINGS, MultidirectionalSettings,
+    _assess_multidirectional_point,
+)
 from .rainflow import CycleTable, count_rainflow_cycles, rainflow_backend_version
 from .results import AssessmentResult, PartResult, PointResult
 from .sn_curves import STANDARD_EDITION, SNCurve, edition_warnings
@@ -87,6 +91,7 @@ class TimeSeriesSettings:
     scf: float = 1.0
     measure: StressMeasure = StressMeasure("normal_to_weld")
     mean_stress: str = "none"
+    multidirectional: Optional[MultidirectionalSettings] = None
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.thickness_mm) and self.thickness_mm > 0.0):
@@ -112,6 +117,14 @@ class TimeSeriesSettings:
                 "the DNV effective hot-spot stress is defined for stress ranges; "
                 "it cannot be used for a signed time history"
             )
+        if self.multidirectional is not None:
+            md = self.multidirectional
+            if not isinstance(md, MultidirectionalSettings):
+                raise InputError("multidirectional must be MultidirectionalSettings")
+            if self.mean_stress != "none" or self.measure != StressMeasure("normal_to_weld"):
+                raise InputError("multidirectional fatigue requires normal_to_weld and mean_stress='none'")
+            if md.planes[0].curve != self.curve:
+                raise InputError("the zero-degree plane curve must equal the baseline curve")
         object.__setattr__(self, "blocks", blocks)
 
     def to_dict(self) -> dict:
@@ -121,12 +134,16 @@ class TimeSeriesSettings:
             "scf": self.scf, "measure": self.measure.to_text(),
             "mean_stress": self.mean_stress,
             "blocks": [b.to_dict() for b in self.blocks],
+            **({"multidirectional": self.multidirectional.to_dict()}
+               if self.multidirectional is not None else {}),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "TimeSeriesSettings":
         body = dict(data)
+        md = body.pop("multidirectional", None)
         return cls(
+            multidirectional=MultidirectionalSettings.from_dict(md) if md is not None else None,
             curve=SNCurve.from_dict(body.pop("curve")),
             blocks=tuple(LoadBlock.from_dict(b) for b in body.pop("blocks")),
             measure=StressMeasure.parse(body.pop("measure")),
@@ -173,6 +190,13 @@ def assess_time_series(
     points = [p for location in locations for p in extract(source, location)]
     results = [_assess_point(p, settings, geometry, keep_series) for p in points]
     warnings = list(edition_warnings(settings.curve))
+    provenance = _provenance(source)
+    if settings.multidirectional is not None:
+        warnings.extend(METHOD_WARNINGS)
+        for plane in settings.multidirectional.planes:
+            warnings.extend(w for w in edition_warnings(plane.curve) if w not in warnings)
+        provenance.update(multidirectional_method=METHOD_ID, multidirectional_source=METHOD_SOURCE,
+                          accumulation="maximum fixed-plane damage after summing load blocks")
     covered = sum(b.exposure_fraction for b in settings.blocks)
     if covered < 1.0 - 1e-9:
         warnings.append(
@@ -183,12 +207,17 @@ def assess_time_series(
         method="time_series",
         points=tuple(results),
         settings=settings.to_dict(),
-        provenance=_provenance(source),
+        provenance=provenance,
         warnings=tuple(warnings),
     )
 
 
 def _assess_point(point: SamplePoint, settings: TimeSeriesSettings, geometry, keep_series) -> PointResult:
+    if settings.multidirectional is not None:
+        if point.weld_direction is None:
+            raise InputError(f"{point.label}: multidirectional fatigue requires a fixed weld direction")
+        baseline = _assess_point(point, replace(settings, multidirectional=None), geometry, False)
+        return _assess_multidirectional_point(point, settings, geometry, keep_series, baseline.damage)
     measure = settings.measure
     if measure.needs_weld_direction and point.weld_direction is None:
         raise InputError(

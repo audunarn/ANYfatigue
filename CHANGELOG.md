@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in fixed-plane normal-master/global-shear-range shell fatigue, explicit gamma and
+  directional S-N assignments, weld-normal baseline, directional damage reports and saved
+  definition/CLI integration. Preserve the scalar default and extraction methods.
+- Guard the scalar GUI against silently discarding multidirectional settings.
+- See `docs/MULTIDIRECTIONAL.md` for the method subset, source editions and verification limits.
+
 ## 0.1.0 (unreleased)
 
 First implementation.
