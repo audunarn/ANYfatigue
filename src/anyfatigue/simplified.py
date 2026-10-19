@@ -31,6 +31,8 @@ from .errors import InputError
 from .extract import SamplePoint, extract
 from .measures import StressMeasure
 from .model import StressSource
+from .parent_plate import extraction_provenance
+from .tensor import completeness_of
 from .results import AssessmentResult, PartResult, PointResult
 from .sn_curves import STANDARD_EDITION, SNCurve, edition_warnings
 
@@ -156,7 +158,7 @@ def assess_simplified(
         method="simplified",
         points=tuple(results),
         settings=settings.to_dict(),
-        provenance=_provenance(source),
+        provenance=extraction_provenance(_provenance(source), locations),
         warnings=tuple(dict.fromkeys(warnings)),
     )
 
@@ -222,6 +224,7 @@ def _provenance(source: StressSource) -> dict:
         "standard": STANDARD_EDITION,
         "method": "DNV-RP-C203 section 5 (simplified fatigue analysis), (5.1.2), (D.13-1)",
         "stress_unit": "MPa",
+        "tensor_completeness": completeness_of(source).to_dict(),
         "nodal_stress": source.nodal_origin,
         "source": dict(source.provenance),
         "cases": list(source.case_labels),

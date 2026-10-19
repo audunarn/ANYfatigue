@@ -38,6 +38,8 @@ from .multidirectional import (
     METHOD_ID, METHOD_SOURCE, METHOD_WARNINGS, MultidirectionalSettings,
     _assess_multidirectional_point,
 )
+from .tensor import completeness_of, require_in_plane_tensor
+from .parent_plate import extraction_provenance
 from .rainflow import CycleTable, count_rainflow_cycles, rainflow_backend_version
 from .results import AssessmentResult, PartResult, PointResult
 from .sn_curves import STANDARD_EDITION, SNCurve, edition_warnings
@@ -188,9 +190,12 @@ def assess_time_series(
         raise InputError("at least one stress location is required")
     geometry = {b.name: _block_geometry(source, b) for b in settings.blocks}
     points = [p for location in locations for p in extract(source, location)]
+    if getattr(settings, "multidirectional", None) is not None:
+        for point in points:
+            require_in_plane_tensor(source, point.normal, context=point.label + " multidirectional fatigue")
     results = [_assess_point(p, settings, geometry, keep_series) for p in points]
     warnings = list(edition_warnings(settings.curve))
-    provenance = _provenance(source)
+    provenance = extraction_provenance(_provenance(source), locations)
     if settings.multidirectional is not None:
         warnings.extend(METHOD_WARNINGS)
         for plane in settings.multidirectional.planes:
@@ -278,6 +283,7 @@ def _provenance(source: StressSource) -> dict:
         "method": "rainflow counting (ASTM E1049-85 5.4.4 via ANYtimeseries) and Palmgren-Miner",
         "rainflow_backend": f"anytimes {rainflow_backend_version()}",
         "stress_unit": "MPa",
+        "tensor_completeness": completeness_of(source).to_dict(),
         "nodal_stress": source.nodal_origin,
         "source": dict(source.provenance),
         "cases": list(source.case_labels),

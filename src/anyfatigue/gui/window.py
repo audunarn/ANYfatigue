@@ -669,6 +669,9 @@ class MainWindow(QMainWindow):
     def set_definition(self, definition: AnalysisDefinition) -> None:
         """Fill every form from a definition."""
 
+        if any(getattr(loc, "parent_plate", None) is not None for loc in definition.locations):
+            raise InputError("Parent-plate definitions require the Python API or CLI; "
+                             "the GUI cannot preserve parent recovery selections.")
         if getattr(definition.settings, "multidirectional", None) is not None:
             raise InputError(
                 "Multidirectional definitions require the Python API or CLI; the GUI "

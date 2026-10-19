@@ -114,6 +114,21 @@ def report_markdown(result: AssessmentResult, *, top: int = 15) -> str:
         f"* Stresses in {prov['stress_unit']}; nodal stress: {prov['nodal_stress']}",
         f"* ANYfatigue {prov['anyfatigue_version']}; {prov['method']}",
     ]
+    declaration = prov.get("tensor_completeness", prov.get("source", {}).get("tensor_completeness"))
+    if declaration is not None:
+        known = declaration["provided"] + declaration["assumed_zero"]
+        missing = [c for c in ("xx", "yy", "zz", "xy", "yz", "xz") if c not in known]
+        lines.append("* Tensor components (global): provided " + (", ".join(declaration["provided"]) or "none")
+                     + "; assumed zero " + (", ".join(declaration["assumed_zero"]) or "none")
+                     + "; missing " + (", ".join(missing) or "none"))
+        if declaration["basis"]:
+            lines.append("* Tensor assumption basis: " + declaration["basis"])
+    for location in prov.get("locations", ()):
+        parent = location.get("parent_plate")
+        if parent:
+            lines.append(f"* Parent patch for {location['name']}: {parent['name']}; "
+                         f"element IDs {parent['element_ids']}; recovery {parent['nodal_recovery']}; "
+                         f"mesh binding {parent['mesh_id'] or 'not supplied (mesh-relative IDs)'}")
     if "rainflow_backend" in prov:
         lines.append(f"* Rainflow backend: {prov['rainflow_backend']}")
     lines += ["", "## Verdict", ""]
