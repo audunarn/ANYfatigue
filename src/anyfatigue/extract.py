@@ -40,12 +40,14 @@ import numpy as np
 
 from .errors import ExtractionError, InputError
 from .model import SURFACES, StressSource
+from .parent_plate import ParentPlate, bind_parent
 
 __all__ = [
     "ElementLocation",
     "LineLocation",
     "LOCATION_TYPES",
     "PointLocation",
+    "ParentPlate",
     "ReadOut",
     "SamplePoint",
     "extract",
@@ -205,7 +207,7 @@ def _interpolate(
     """Nodal stress interpolated at ``points``: ``(n_cases, M, 6)``, normals, element rows."""
 
     mesh = source.mesh
-    rows, weights, _distance = mesh.locate(points, tolerance)
+    rows, weights, _distance = mesh.locate(points, tolerance, unique_surface=True)
     corner = mesh.corner_rows[rows]
     needed = np.unique(corner[corner >= 0])
     nodal = source.node_stress(needed, surface)
@@ -258,6 +260,8 @@ def _hot_spot_batch(
     points are retried one by one so the error names the offending location.
     """
 
+    if hasattr(source, "check_readout_side"):
+        source.check_readout_side(origins, directions)
     offsets = readout.offsets_m
     n = len(origins)
     probes = np.concatenate([origins + s * directions for s in offsets])
@@ -286,6 +290,7 @@ class LineLocation:
     weld_direction: Optional[Tuple[float, float, float]] = None
     tolerance: Optional[float] = None
     name: str = "line"
+    parent_plate: Optional[ParentPlate] = None
 
     def __post_init__(self) -> None:
         ids = tuple(int(i) for i in self.node_ids)
@@ -296,12 +301,15 @@ class LineLocation:
         object.__setattr__(self, "node_ids", ids)
         object.__setattr__(self, "surfaces", _surfaces(self.surfaces))
         object.__setattr__(self, "weld_direction", _opt_vector(self.weld_direction))
+        if self.parent_plate is not None and not isinstance(self.parent_plate, ParentPlate):
+            raise InputError("parent_plate must be ParentPlate")
 
     def resolve(self, source: StressSource) -> List[SamplePoint]:
+        source = bind_parent(source, self.parent_plate)
         mesh = source.mesh
         rows = [mesh.node_row(i) for i in self.node_ids]
         xyz = mesh.node_xyz[rows]
-        normals = mesh.node_normals(rows)
+        normals = mesh.node_normals(rows, require_consistent=self.readout.method != "direct")
         tangents = self._tangents(xyz)
         chainage = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))))
         weld = []
@@ -370,6 +378,7 @@ class LineLocation:
             "surfaces": list(self.surfaces), "readout": self.readout.to_dict(),
             "weld_direction": None if self.weld_direction is None else list(self.weld_direction),
             "tolerance": self.tolerance,
+            **({"parent_plate": self.parent_plate.to_dict()} if self.parent_plate else {}),
         }
 
 
@@ -386,6 +395,7 @@ class PointLocation:
     weld_direction: Optional[Tuple[float, float, float]] = None
     tolerance: Optional[float] = None
     name: str = "points"
+    parent_plate: Optional[ParentPlate] = None
 
     def __post_init__(self) -> None:
         pts = tuple(tuple(float(v) for v in p) for p in self.points)
@@ -394,8 +404,11 @@ class PointLocation:
         object.__setattr__(self, "points", pts)
         object.__setattr__(self, "surfaces", _surfaces(self.surfaces))
         object.__setattr__(self, "weld_direction", _opt_vector(self.weld_direction))
+        if self.parent_plate is not None and not isinstance(self.parent_plate, ParentPlate):
+            raise InputError("parent_plate must be ParentPlate")
 
     def resolve(self, source: StressSource) -> List[SamplePoint]:
+        source = bind_parent(source, self.parent_plate)
         pts = np.asarray(self.points, dtype=float)
         out: List[SamplePoint] = []
         for surface in self.surfaces:
@@ -451,6 +464,7 @@ class PointLocation:
             "surfaces": list(self.surfaces), "readout": self.readout.to_dict(),
             "weld_direction": None if self.weld_direction is None else list(self.weld_direction),
             "tolerance": self.tolerance,
+            **({"parent_plate": self.parent_plate.to_dict()} if self.parent_plate else {}),
         }
 
 
@@ -475,6 +489,8 @@ def location_from_dict(data: Dict) -> "ElementLocation | LineLocation | PointLoc
     body = {k: v for k, v in data.items() if k != "type"}
     if kind == "element":
         return ElementLocation(**body)
+    if kind in ("line", "point") and body.get("parent_plate") is not None:
+        body["parent_plate"] = ParentPlate.from_dict(body["parent_plate"])
     if kind == "line":
         body["readout"] = ReadOut.from_dict(body.get("readout", {}))
         return LineLocation(**body)

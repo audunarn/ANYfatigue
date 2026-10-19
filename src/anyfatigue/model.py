@@ -30,6 +30,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from .errors import ExtractionError, InputError
+from .tensor import TENSOR_ORDER, TensorCompleteness
 
 __all__ = [
     "SURFACES",
@@ -39,7 +40,6 @@ __all__ = [
     "SurfaceMesh",
 ]
 
-TENSOR_ORDER = ("xx", "yy", "zz", "xy", "yz", "xz")
 SURFACES = ("top", "bottom")
 
 
@@ -223,7 +223,7 @@ class SurfaceMesh:
             self._cache["incident"] = cached
         return cached
 
-    def node_normals(self, node_rows: Sequence[int]) -> np.ndarray:
+    def node_normals(self, node_rows: Sequence[int], *, require_consistent: bool = False) -> np.ndarray:
         """Average normal of the elements at each node (sign-aligned)."""
 
         incident = self.incident_elements()
@@ -236,6 +236,11 @@ class SurfaceMesh:
                     f"node {int(self.node_ids[int(row)])} belongs to no element"
                 )
             reference = normals[elements[0]]
+            if require_consistent and not np.allclose(normals[elements], reference, rtol=0.0, atol=256*np.finfo(float).eps):
+                raise ExtractionError(
+                    f"node {int(self.node_ids[int(row)])} touches different physical surfaces; "
+                    "supply an explicit parent_plate recovery patch"
+                )
             total = np.zeros(3)
             for e in elements:
                 n = normals[e]
@@ -245,7 +250,7 @@ class SurfaceMesh:
 
     # ------------------------------------------------------------------
     def locate(
-        self, points: np.ndarray, tolerance: Optional[float] = None
+        self, points: np.ndarray, tolerance: Optional[float] = None, *, unique_surface: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Find the element under each point.
 
@@ -275,6 +280,7 @@ class SurfaceMesh:
         for i, p in enumerate(pts):
             candidates = np.flatnonzero(np.all((p >= lo - tol) & (p <= hi + tol), axis=1))
             best = None
+            accepted = []
             for e in candidates:
                 found = self._local(int(e), p)
                 if found is None:
@@ -282,7 +288,8 @@ class SurfaceMesh:
                 weights, distance, inside = found
                 if distance > tol or inside > slack:
                     continue
-                key = (round(distance, 12), int(self.element_ids[e]))
+                accepted.append((int(e), weights, distance))
+                key = (distance if unique_surface else round(distance, 12), int(self.element_ids[e]))
                 if best is None or key < best[0]:
                     best = (key, int(e), weights, distance)
             if best is None:
@@ -290,6 +297,25 @@ class SurfaceMesh:
                     f"point {tuple(float(v) for v in p)} lies on no element "
                     f"within {tol:.3g} m of the mesh surface"
                 )
+            if unique_surface:
+                _, chosen, chosen_weights, closest = best
+                guard = 256 * np.finfo(float).eps * max(float(np.max(np.abs(p))), self.characteristic_length())
+                support = set(self.element_corner_ids[chosen][chosen_weights > 1e-9])
+                full = set(self.element_corner_ids[chosen][self.corner_rows[chosen] >= 0])
+                for other, weights, distance in accepted:
+                    if other == chosen or abs(distance - closest) > guard:
+                        continue
+                    other_support = set(self.element_corner_ids[other][weights > 1e-9])
+                    other_full = set(self.element_corner_ids[other][self.corner_rows[other] >= 0])
+                    same_normal = np.allclose(self.normals()[other], self.normals()[chosen],
+                                              rtol=0.0, atol=256*np.finfo(float).eps)
+                    # A shared edge/node of the SAME oriented sheet is safe:
+                    # interpolation uses the identical nodal support there.
+                    if not same_normal or support != other_support or len(support) > 2 or full == other_full:
+                        raise ExtractionError(
+                            f"point {tuple(p)} lies on ambiguous physical surfaces; "
+                            "supply an explicit parent_plate recovery patch"
+                        )
             _key, out_rows[i], out_weights[i], out_dist[i] = best
         return out_rows, out_weights, out_dist
 
@@ -353,6 +379,8 @@ class StressSource:
     case_labels: Tuple[str, ...]
     case_times: Tuple[Optional[float], ...]
     provenance: Mapping[str, object]
+    # Unknown for legacy/custom producers unless they explicitly declare it.
+    tensor_completeness: Optional[TensorCompleteness] = None
 
     @property
     def n_cases(self) -> int:
@@ -407,6 +435,7 @@ class ArrayStressSource(StressSource):
         node_bottom: Optional[np.ndarray] = None,
         nodal_origin: Optional[str] = None,
         provenance: Optional[Mapping[str, object]] = None,
+        tensor_completeness: Optional[TensorCompleteness] = None,
     ) -> None:
         self.mesh = mesh
         self.case_labels = tuple(str(label) for label in labels)
@@ -434,7 +463,16 @@ class ArrayStressSource(StressSource):
             "supplied nodal field" if self._nd is not None else "element average"
         )
         self._averaged: Dict[str, np.ndarray] = {}
+        # Supplying six array components is an explicit full-tensor contract.
+        # Importers with placeholders MUST pass their actual declaration.
+        self.tensor_completeness = (TensorCompleteness(TENSOR_ORDER)
+                                    if tensor_completeness is None else tensor_completeness)
+        if not isinstance(self.tensor_completeness, TensorCompleteness):
+            raise InputError("tensor_completeness must be TensorCompleteness")
+        for values in list(self._el.values()) + list((self._nd or {}).values()):
+            self.tensor_completeness.validate_values(values)
         self.provenance = dict(provenance or {})
+        self.provenance["tensor_completeness"] = self.tensor_completeness.to_dict()
 
     @property
     def nodal_origin(self) -> str:
@@ -466,6 +504,8 @@ class ArrayStressSource(StressSource):
 
 
 def _checked(array, shape, name) -> np.ndarray:
+    if np.iscomplexobj(array):
+        raise InputError(f"{name} must contain real time-domain stresses, not complex amplitudes")
     a = np.asarray(array, dtype=float)
     if a.shape != shape:
         raise InputError(f"{name} must have shape {shape}, got {a.shape}")

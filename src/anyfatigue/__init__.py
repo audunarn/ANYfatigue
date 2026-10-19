@@ -21,6 +21,8 @@ from .errors import (
 )
 from .sn_curves import SNCurve, get_curve
 from .multidirectional import FatiguePlane, MultidirectionalSettings
+from .parent_plate import ParentPlate
+from .tensor import TensorCompleteness
 
 __version__ = "0.1.0"
 
@@ -29,6 +31,8 @@ __all__ = [
     "FatigueError",
     "FatiguePlane",
     "MultidirectionalSettings",
+    "ParentPlate",
+    "TensorCompleteness",
     "InputError",
     "MissingDependencyError",
     "SNCurve",
