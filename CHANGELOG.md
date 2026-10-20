@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add opt-in cycle-associated shear, with fractional first-return closure and explicit half-cycle handling.
+- Keep global-range mode unchanged; consume the ANYtimeseries indexed v1 contract without fallback.
+- Export cycle support, shear ranges and individual damage via Python and CLI --include-cycles.
+
 - Add opt-in fixed-plane normal-master/global-shear-range shell fatigue, explicit gamma and
   directional S-N assignments, weld-normal baseline, directional damage reports and saved
   definition/CLI integration. Preserve the scalar default and extraction methods.

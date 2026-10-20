@@ -1,9 +1,10 @@
-"""Fixed-material-plane fatigue with normal-master/global-shear-range counting.
+"""Fixed-material-plane normal-master fatigue with explicit shear association.
 
 The interaction is gamma * hypot(normal_range, 0.9 * shear_range), as in
 DNVGL-RP-C203 (2019, amended 2020), F.12.4; see docs/MULTIDIRECTIONAL.md.
-This implements the global-range alternative, NOT indexed master/slave cycle
-matching or F.12.1 crack-sector accumulation. S-N data keep their own edition.
+The global-range alternative is preserved. The opt-in cycle_associated mode uses
+ANYfatigue chronological first-return policy v1, not a claim of complete F.12
+master/slave qualification or F.12.1 crack-sector accumulation.
 Rainflow counting remains owned by ANYtimeseries.
 """
 
@@ -11,14 +12,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+from numbers import Integral
 
 import numpy as np
 
 from .damage import SECONDS_PER_YEAR, miner_damage
 from .errors import InputError
 from .measures import in_plane_components
-from .rainflow import CycleTable, count_rainflow_cycles
+from .rainflow import CycleTable, count_rainflow_cycles, count_indexed_rainflow_cycles
+from .cycle_association import associate_shear_cycles
 from .results import DirectionResult, PartResult, PointResult
 from .sn_curves import SNCurve
 
@@ -32,6 +35,7 @@ __all__ = [
 ]
 
 METHOD_ID = "normal_master_global_shear_range_v1"
+ASSOCIATED_METHOD_ID = "normal_master_cycle_associated_shear_v1"
 METHOD_SOURCE = "DNVGL-RP-C203 September 2019, amended January 2020, F.12"
 METHOD_WARNINGS = (
     "Multidirectional assessment uses normal-master rainflow with the maximum "
@@ -44,6 +48,18 @@ METHOD_WARNINGS = (
     "The multidirectional procedure is an implementation of the stated 2019/2020 "
     "method subset, not an independently qualified or current-edition DNV assessment. "
     "The supplied gamma and directional curve assignments require engineering review.",
+)
+
+
+ASSOCIATED_METHOD_WARNINGS = (
+    "Cycle-associated shear uses chronological first-return windows, with exactly matching "
+    "adjacent half cycles paired and unmatched halves assessed over their own intervals. "
+    "Nested excursions remain in parent windows. This is an explicit envelope convention, "
+    "not a unique multiaxial decomposition or independent fatigue-life qualification.",
+    METHOD_WARNINGS[1],
+    "The interaction equation retains its stated 2019/2020 source; temporal support is "
+    "ANYfatigue policy v1, not a verified current-edition DNV requirement. Explicit gamma "
+    "and directional S-N assignments still require engineering review.",
 )
 
 
@@ -118,6 +134,7 @@ class MultidirectionalSettings:
     gamma_basis: str
     curve_basis: str
     shear_association: str = "global_range"
+    cycle_chunk_size: Optional[int] = None
 
     def __post_init__(self) -> None:
         try:
@@ -139,15 +156,23 @@ class MultidirectionalSettings:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise InputError(f"{name} must describe the engineering basis")
-        if self.shear_association != "global_range":
-            raise InputError("only shear_association='global_range' is supported; cycle indices are unavailable")
+        if self.shear_association not in ("global_range", "cycle_associated"):
+            raise InputError("shear_association must be 'global_range' or 'cycle_associated'")
+        if self.cycle_chunk_size is not None:
+            if (isinstance(self.cycle_chunk_size, (bool, np.bool_))
+                or not isinstance(self.cycle_chunk_size, Integral) or self.cycle_chunk_size <= 0):
+                raise InputError("cycle_chunk_size must be a positive integer or None")
+            if self.shear_association != "cycle_associated":
+                raise InputError("cycle_chunk_size requires cycle_associated mode")
+            object.__setattr__(self, "cycle_chunk_size", int(self.cycle_chunk_size))
         object.__setattr__(self, "planes", tuple(sorted(planes, key=lambda p: p.angle_deg)))
         object.__setattr__(self, "gamma", gamma)
 
     @classmethod
     def uniform(
         cls, curve: SNCurve, *, gamma: float, gamma_basis: str, curve_basis: str,
-        step_deg: float = 5.0,
+        step_deg: float = 5.0, shear_association: str = "global_range",
+        cycle_chunk_size: Optional[int] = None,
     ) -> "MultidirectionalSettings":
         """Explicitly assign one curve to all grid directions; this is not a DNV classification.
 
@@ -162,7 +187,7 @@ class MultidirectionalSettings:
         count = math.ceil(180.0 / step)
         return cls(
             tuple(FatiguePlane(float(a), curve) for a in np.linspace(0.0, 180.0, count, endpoint=False)),
-            gamma, gamma_basis, curve_basis,
+            gamma, gamma_basis, curve_basis, shear_association, cycle_chunk_size,
         )
 
     def to_dict(self) -> dict:
@@ -170,6 +195,7 @@ class MultidirectionalSettings:
             "planes": [p.to_dict() for p in self.planes], "gamma": self.gamma,
             "gamma_basis": self.gamma_basis, "curve_basis": self.curve_basis,
             "shear_association": self.shear_association,
+            **({"cycle_chunk_size": self.cycle_chunk_size} if self.cycle_chunk_size is not None else {}),
         }
 
     @classmethod
@@ -257,7 +283,12 @@ def _assess_multidirectional_point(
             normal, shear = _project(*components, plane.angle_deg)
             if not np.all(np.isfinite(normal)) or not np.all(np.isfinite(shear)):
                 raise InputError(f"{point.label}: stress projection overflowed")
-            cycles = count_rainflow_cycles(normal, endpoints=True)
+            indexed = None
+            if md.shear_association == "cycle_associated":
+                indexed = count_indexed_rainflow_cycles(normal, endpoints=True, chunk_size=md.cycle_chunk_size)
+                cycles = indexed.cycles
+            else:
+                cycles = count_rainflow_cycles(normal, endpoints=True)
             keep = cycles.ranges > resolution
             discarded = float(cycles.counts[~keep].sum())
             ignored_cycles += discarded
@@ -267,17 +298,25 @@ def _assess_multidirectional_point(
                 shear_range = 0.0
             if not len(cycles) and shear_range > 0.0:
                 inactive_shear_planes += 1
-            equivalent = multidirectional_equivalent_range(cycles.ranges, shear_range, gamma=md.gamma)
+            association = None
+            applied_shear = shear_range
+            if indexed is not None:
+                association = associate_shear_cycles(normal, shear, indexed.select(keep), times=times, resolution=resolution)
+                applied_shear = association.shear_ranges
+            equivalent = multidirectional_equivalent_range(cycles.ranges, applied_shear, gamma=md.gamma)
             scale = block.exposure_fraction * settings.design_life_years * SECONDS_PER_YEAR / duration
-            damage = miner_damage(
+            miner = miner_damage(
                 equivalent, cycles.counts, plane.curve, scf=settings.scf,
                 thickness_mm=settings.thickness_mm, scale=scale,
-            ).total
+            )
+            damage = miner.total
             if not math.isfinite(damage):
                 raise InputError(f"{point.label}: multidirectional damage overflowed")
             parts.append(PartResult(
                 name=block.name, damage=damage, cycles=cycles,
                 equivalent_ranges=equivalent, curve=plane.curve,
+                cycle_association=association,
+                cycle_damage=miner.per_cycle if association is not None else None,
                 series=normal if keep_series else None,
                 series_times=times if keep_series else None,
                 values={
@@ -286,6 +325,10 @@ def _assess_multidirectional_point(
                     "max_range_mpa": float(equivalent.max()) if equivalent.size else 0.0,
                     "max_normal_range_mpa": cycles.max_range,
                     "global_shear_range_mpa": shear_range,
+                    **({"max_associated_shear_range_mpa": float(applied_shear.max()) if len(applied_shear) else 0.0,
+                        "paired_half_cycle_rows": float(np.count_nonzero(association.paired_cycle_indices >= 0)),
+                        "unmatched_half_cycle_rows": float(sum(k == "half_interval" for k in association.support_kinds))}
+                       if association is not None else {}),
                     "gamma": md.gamma,
                     "roundoff_range_bound_mpa": resolution,
                     "discarded_roundoff_cycles": discarded,

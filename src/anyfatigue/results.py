@@ -9,6 +9,7 @@ from typing import Dict, Mapping, Optional, Tuple
 import numpy as np
 
 from .rainflow import CycleTable
+from .cycle_association import CycleAssociation
 from .sn_curves import SNCurve
 
 __all__ = ["AssessmentResult", "DirectionResult", "PartResult", "PointResult"]
@@ -27,6 +28,8 @@ class PartResult:
     # Raw cycles retain NORMAL ranges/means; these are the ranges used for damage.
     equivalent_ranges: Optional[np.ndarray] = None
     curve: Optional[SNCurve] = None
+    cycle_association: Optional[CycleAssociation] = None
+    cycle_damage: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)

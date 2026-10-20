@@ -88,7 +88,7 @@ print(result.critical.label, result.critical.damage, result.critical.usage)
 Time-series assessments now accept an explicit `MultidirectionalSettings` option.
 It resolves the full surface tensor onto fixed material planes, counts the signed
 normal history through ANYtimeseries, and combines each counted range with that
-plane's **whole-block shear range**. Damage is accumulated across blocks on each
+plane's **whole-block shear range**, or optionally a cycle-associated shear window. Damage is accumulated across blocks on each
 plane before selecting the governing plane. The weld-normal baseline, directional
 curves, all directional damage totals and governing angle are retained in results.
 
@@ -98,8 +98,9 @@ There is no automatic curve reassignment or additional 1.12 multiplier.
 
 This is an opt-in **2019/2020 F.12 method subset**, not current-edition DNV
 qualification. Gamma and the basis for directional curve assignments must be
-supplied explicitly. Exact time-matched shear cycles and F.12.1 crack-sector
-accumulation are not implemented. The Python API and saved-definition CLI support
+supplied explicitly. The new `cycle_associated` option uses an explicitly documented first-return
+window convention, not a claim of complete DNV master/slave qualification.
+F.12.1 crack-sector accumulation is not implemented. The Python API and saved-definition CLI support
 it; the GUI rejects these definitions rather than silently losing the settings.
 See [the algorithm, runnable example and verification record](docs/MULTIDIRECTIONAL.md).
 
@@ -153,3 +154,21 @@ results, the second-order stress fit for coarse 4-node meshes (DNV 4.3.3),
 mean-stress effects in welds, tubular-joint SCF methods and fracture-mechanics
 assessment are not implemented. See
 [docs/DESIGN.md](docs/DESIGN.md).
+
+
+### Cycle-associated shear (development addition)
+
+Set `shear_association="cycle_associated"` on `MultidirectionalSettings` (or its
+`uniform` constructor). This requires the ANYtimeseries **indexed contract v1**;
+the old published `anytimes 1.1.0` does not provide it. The missing capability
+raises an actionable error; no global-envelope fallback is made.
+
+Full cycles include the returning branch through the first return to the
+starting normal level, including fractional-sample closure. Exactly matching
+adjacent half cycles share a complete loop window while retaining their counts;
+unmatched halves use their own intervals. `cycle_chunk_size` is optional and
+changes computation only. Different LoadBlocks are still independent records.
+Use `anyfatigue run ... --include-cycles` for JSON cycle-support and damage audit.
+See [CYCLE_ASSOCIATION.md](docs/CYCLE_ASSOCIATION.md) for installation, examples,
+conventions, verification and engineering limits. Existing definitions continue
+to use `global_range`.
