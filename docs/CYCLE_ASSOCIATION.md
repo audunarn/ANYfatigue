@@ -166,7 +166,7 @@ were not modified, and accessible repository/governance instructions were used.
 ## Development installation and CI dependency
 
 The paired owner is ANYtimeseries PR #306, frozen at
-`6132cf15e010b13c231ed59f6ecc1c01e9ddea22` in `requirements-indexed.txt`.
+`80d3044c9ff5c406d1a7c8c8289562b2f40418fb` in `requirements-indexed.txt`.
 From this ANYfatigue checkout, install the normal dependencies followed by the
 explicit development owner:
 
