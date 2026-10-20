@@ -107,3 +107,103 @@ def count_rainflow_cycles(series, *, endpoints: bool = True) -> CycleTable:
         means=np.ascontiguousarray(table[keep, 1]),
         counts=np.ascontiguousarray(table[keep, 2]),
     )
+
+
+@dataclass(frozen=True)
+class IndexedCycleTable:
+    """Normal cycles plus owner indices, in detection order (never range-sorted)."""
+    cycles: CycleTable
+    start_indices: np.ndarray
+    end_indices: np.ndarray
+    closing_indices: np.ndarray  # -1 for final residual halves
+    kinds: tuple
+
+    def select(self, keep):
+        return IndexedCycleTable(
+            CycleTable(self.cycles.ranges[keep], self.cycles.means[keep], self.cycles.counts[keep]),
+            self.start_indices[keep], self.end_indices[keep], self.closing_indices[keep],
+            tuple(k for k, selected in zip(self.kinds, keep) if selected),
+        )
+
+
+def require_indexed_backend():
+    """Fail closed rather than falling back to a global shear envelope."""
+    backend = _backend()
+    if getattr(backend, "INDEXED_CYCLES_VERSION", None) != 1 or not callable(
+        getattr(backend, "count_cycles_indexed", None)
+    ):
+        raise MissingDependencyError(
+            "cycle_associated requires ANYtimeseries indexed rainflow contract v1; "
+            "install the indexed-rainflow owner build described in docs/CYCLE_ASSOCIATION.md. "
+            "The published anytimes 1.1.0 does not provide it. No fallback was used."
+        )
+    return backend
+
+
+def count_indexed_rainflow_cycles(series, *, endpoints=True, chunk_size=None) -> IndexedCycleTable:
+    """Delegate indexed counting and validate the public owner contract."""
+    backend = require_indexed_backend()
+    try:
+        if np.iscomplexobj(series):
+            raise ValueError("complex history")
+        values = np.asarray(series, dtype=float)
+        if values.ndim != 1 or not np.all(np.isfinite(values)):
+            raise ValueError("not a finite vector")
+        records = backend.count_cycles_indexed(values, endpoints=endpoints, chunk_size=chunk_size)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise InputError(f"invalid indexed rainflow history/options: {error}") from error
+    r, m, c, starts, ends, closes, kinds = [], [], [], [], [], [], []
+    for record in records:
+        try:
+            a, b, closing = record.start_index, record.end_index, record.closing_index
+            if not all(isinstance(i, (int, np.integer)) and not isinstance(i, (bool, np.bool_)) for i in (a, b)):
+                raise ValueError("non-integer indices")
+            if not 0 <= a < b < len(values):
+                raise ValueError("reversal indices outside the original record")
+            if record.kind not in ("full", "initial_half", "residual_half"):
+                raise ValueError("unknown cycle kind")
+            if record.count != (1.0 if record.kind == "full" else 0.5):
+                raise ValueError("cycle kind/count mismatch")
+            if record.kind == "residual_half":
+                if closing is not None:
+                    raise ValueError("residual has a closing reversal")
+            elif (not isinstance(closing, (int, np.integer)) or isinstance(closing, (bool, np.bool_))
+                  or not b < closing < len(values)):
+                raise ValueError("missing or invalid closing reversal")
+            expected_range = abs(float(values[b])-float(values[a]))
+            total = float(values[b])+float(values[a])
+            expected_mean = 0.5*total if np.isfinite(total) else 0.5*values[b]+0.5*values[a]
+            if not np.isfinite(record.range) or not np.isfinite(record.mean):
+                raise ValueError("non-finite cycle")
+            if record.range != expected_range or record.mean != expected_mean:
+                raise ValueError("cycle values disagree with the indexed input samples")
+        except (AttributeError, TypeError, ValueError, OverflowError) as error:
+            raise InputError(f"ANYtimeseries indexed contract violation: {error}") from error
+        if record.range <= 0.0:
+            continue
+        r.append(record.range); m.append(record.mean); c.append(record.count)
+        starts.append(a); ends.append(b); closes.append(-1 if closing is None else closing)
+        kinds.append(record.kind)
+    return IndexedCycleTable(
+        CycleTable(np.asarray(r), np.asarray(m), np.asarray(c)),
+        np.asarray(starts, dtype=np.int64), np.asarray(ends, dtype=np.int64),
+        np.asarray(closes, dtype=np.int64), tuple(kinds),
+    )
+
+
+__all__ += ["IndexedCycleTable", "count_indexed_rainflow_cycles", "require_indexed_backend"]
+
+
+def indexed_backend_provenance():
+    """Record code identity as well as version (development builds may share a version)."""
+    import hashlib
+    import inspect
+    from pathlib import Path
+
+    backend = require_indexed_backend()
+    try:
+        source = inspect.getsourcefile(backend.count_cycles_indexed)
+        digest = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+    except (OSError, TypeError):
+        digest = "unavailable (source bytes not accessible)"
+    return {"indexed_counter_contract": 1, "indexed_counter_source_sha256": digest}

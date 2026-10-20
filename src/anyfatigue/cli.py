@@ -46,7 +46,7 @@ def _run(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     stem = Path(args.analysis).stem
     write_csv(result, out / f"{stem}-points.csv")
-    write_json(result, out / f"{stem}-result.json")
+    write_json(result, out / f"{stem}-result.json", include_cycles=args.include_cycles)
     write_report(result, out / f"{stem}-report.md")
     for warning in result.warnings:
         print(f"warning: {warning}", file=sys.stderr)
@@ -71,6 +71,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument("--anyfem", help="ANYfem project (.anyfem), its -data folder or a .anyres.h5 result")
     run.add_argument("--job-id", help="result to use when --anyfem names a project with several")
     run.add_argument("--out", default=".", help="directory for the reports")
+    run.add_argument("--include-cycles", action="store_true", help="include counted cycles and available association/damage audit in JSON")
     run.set_defaults(func=_run)
     args = parser.parse_args(argv)
     try:

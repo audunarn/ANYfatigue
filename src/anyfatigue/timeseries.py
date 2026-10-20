@@ -16,8 +16,9 @@ their damages add (Palmgren-Miner).  ``T_record`` is ``duration_s`` when given,
 otherwise the span of the case times, last minus first.
 
 The record is treated as non-repeating: its first and last samples start and
-close half cycles.  For a record that genuinely repeats, close it (append the
-first sample) so that its half cycles pair up.
+close half cycles. Appending a repeated endpoint does not implement general
+periodic counting. Computational chunks in cycle-associated mode share counter
+state within a block; different LoadBlocks remain independent finite records.
 """
 
 from __future__ import annotations
@@ -36,11 +37,13 @@ from .measures import StressMeasure
 from .model import StressSource
 from .multidirectional import (
     METHOD_ID, METHOD_SOURCE, METHOD_WARNINGS, MultidirectionalSettings,
+    ASSOCIATED_METHOD_ID, ASSOCIATED_METHOD_WARNINGS,
     _assess_multidirectional_point,
 )
 from .tensor import completeness_of, require_in_plane_tensor
 from .parent_plate import extraction_provenance
-from .rainflow import CycleTable, count_rainflow_cycles, rainflow_backend_version
+from .rainflow import CycleTable, count_rainflow_cycles, rainflow_backend_version, require_indexed_backend, indexed_backend_provenance
+from .cycle_association import ASSOCIATION_POLICY
 from .results import AssessmentResult, PartResult, PointResult
 from .sn_curves import STANDARD_EDITION, SNCurve, edition_warnings
 
@@ -188,6 +191,9 @@ def assess_time_series(
 
     if not locations:
         raise InputError("at least one stress location is required")
+    associated = settings.multidirectional is not None and settings.multidirectional.shear_association == "cycle_associated"
+    if associated:
+        require_indexed_backend()
     geometry = {b.name: _block_geometry(source, b) for b in settings.blocks}
     points = [p for location in locations for p in extract(source, location)]
     if getattr(settings, "multidirectional", None) is not None:
@@ -197,11 +203,16 @@ def assess_time_series(
     warnings = list(edition_warnings(settings.curve))
     provenance = extraction_provenance(_provenance(source), locations)
     if settings.multidirectional is not None:
-        warnings.extend(METHOD_WARNINGS)
+        warnings.extend(ASSOCIATED_METHOD_WARNINGS if associated else METHOD_WARNINGS)
         for plane in settings.multidirectional.planes:
             warnings.extend(w for w in edition_warnings(plane.curve) if w not in warnings)
-        provenance.update(multidirectional_method=METHOD_ID, multidirectional_source=METHOD_SOURCE,
+        provenance.update(multidirectional_method=ASSOCIATED_METHOD_ID if associated else METHOD_ID,
+                          multidirectional_source=METHOD_SOURCE + " (interaction only)" if associated else METHOD_SOURCE,
                           accumulation="maximum fixed-plane damage after summing load blocks")
+        if associated:
+            provenance.update(indexed_backend_provenance())
+            provenance.update(cycle_association_policy=ASSOCIATION_POLICY,
+                              record_boundary="independent finite LoadBlocks; computational chunks share counter state")
     covered = sum(b.exposure_fraction for b in settings.blocks)
     if covered < 1.0 - 1e-9:
         warnings.append(

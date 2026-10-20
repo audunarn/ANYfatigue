@@ -1,0 +1,3 @@
+# Optional development owner for cycle_associated. No release is implied.
+# Frozen source identity; legacy scalar/global users need not install this.
+anytimes @ git+https://github.com/audunarn/ANYtimeseries.git@6132cf15e010b13c231ed59f6ecc1c01e9ddea22

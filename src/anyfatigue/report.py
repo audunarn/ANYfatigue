@@ -55,6 +55,9 @@ def result_to_dict(result: AssessmentResult, *, include_cycles: bool = False) ->
             if p.equivalent_ranges is not None:
                 out["cycles"]["range_kind"] = "normal_master"
                 out["cycles"]["equivalent_range_mpa"] = p.equivalent_ranges.tolist()
+            if p.cycle_association is not None:
+                out["cycles"]["association"] = p.cycle_association.to_dict()
+                out["cycles"]["design_life_damage"] = p.cycle_damage.tolist()
         return out
 
     def point(p: PointResult):
@@ -160,6 +163,8 @@ def report_markdown(result: AssessmentResult, *, top: int = 15) -> str:
                   f"Weld-normal baseline damage: {critical.normal_to_weld_damage:.6g}.",
                   f"gamma = {md['gamma']:g}; basis: {md['gamma_basis']}",
                   f"Directional curve basis: {md['curve_basis']}",
+                  f"Shear association: {md['shear_association']}; "
+                  f"policy: {prov.get('cycle_association_policy', 'whole-block range')}",
                   "Block contributions below use the same governing plane throughout.", "",
                   "| angle [deg] | S-N curve | environment | accumulated damage |",
                   "|---:|---|---|---:|"]
