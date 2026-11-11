@@ -37,7 +37,7 @@ _WORKSPACE = _ROOT.parent
 _SIBLINGS = (
     ("anyqats", _WORKSPACE / "ANYtimeseries"),          # rainflow counting (required)
     ("anyfem", _WORKSPACE / "ANYfem" / "src"),          # optional producer of stresses
-    ("anysolver", _WORKSPACE / "ANYsolver" / "src"),
+    ("anyfesolver", _WORKSPACE / "ANYfeSolver" / "src"),
     ("anyloads", _WORKSPACE / "ANYloads" / "src"),
     ("anymaterial", _WORKSPACE / "ANYmaterial" / "src"),
     ("anygeometry", _WORKSPACE / "ANYgeometry" / "src"),

@@ -46,10 +46,10 @@ _SIDE = {"top": "top", "bottom": "bot"}
 def _require_anyfem() -> None:
     try:
         import anyfem  # noqa: F401
-        import anysolver  # noqa: F401
+        import anyfesolver  # noqa: F401
     except ImportError as error:
         raise MissingDependencyError(
-            "reading ANYfem results needs ANYfem and ANYsolver: "
+            "reading ANYfem results needs ANYfem and ANYfeSolver: "
             "`pip install ANYfatigue[anyfem]`"
         ) from error
 
@@ -117,7 +117,7 @@ def from_solutions(
         for surface in SURFACES:
             element[surface][k] = _element_tensors(recovery, element_ids, surface, labels[k])
     if patch:
-        from anysolver import PatchRecoveryConfig
+        from anyfesolver import PatchRecoveryConfig
 
         for surface in SURFACES:
             nodal[surface] = np.zeros((len(shapes), len(node_ids), 6))
@@ -260,7 +260,7 @@ def _versions() -> Dict[str, str]:
     from importlib import metadata
 
     out = {}
-    for name in ("ANYfem", "ANYsolver"):
+    for name in ("ANYfem", "ANYfeSolver"):
         try:
             out[name] = metadata.version(name)
         except metadata.PackageNotFoundError:

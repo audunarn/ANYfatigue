@@ -15,7 +15,7 @@ reports). It consumes, through public contracts:
 | Need | Owner | How consumed |
 |---|---|---|
 | Rainflow counting | ANYtimeseries | `anyqats.fatigue.rainflow.count_cycles`, one adapter (`rainflow.py`); missing package raises `MissingDependencyError`, no fallback counter |
-| Stresses, meshes | ANYfem / ANYsolver | `anyfem_adapter.py` reads `stresses(return_global=True)` and patch recovery; the core depends only on `model.StressSource` |
+| Stresses, meshes | ANYfem / ANYfeSolver | `anyfem_adapter.py` reads `stresses(return_global=True)` and patch recovery; the core depends only on `model.StressSource` |
 
 The fatigue core never imports ANYfem, Qt or h5py. Units at the boundary: metres, **MPa**, global axes;
 conversion (Pa to MPa) happens once in the adapter and is recorded in `provenance`.
