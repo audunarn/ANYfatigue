@@ -25,6 +25,7 @@ import numpy as np
 
 from .errors import InputError
 from .model import TENSOR_ORDER, ArrayStressSource, StressSource, SurfaceMesh
+from .tensor import TensorCompleteness, completeness_of
 
 __all__ = [
     "HISTORY_ELEMENT_ID",
@@ -36,7 +37,7 @@ __all__ = [
 ]
 
 SCHEMA = "anyfatigue.stress"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HISTORY_ELEMENT_ID = 1
 
 
@@ -53,7 +54,7 @@ def materialise(source: StressSource) -> ArrayStressSource:
     return ArrayStressSource(
         mesh, source.case_labels, top_e, bot_e, times=source.case_times,
         node_top=top_n, node_bottom=bot_n, nodal_origin=source.nodal_origin,
-        provenance=dict(source.provenance),
+        provenance=dict(source.provenance), tensor_completeness=completeness_of(source),
     )
 
 
@@ -65,6 +66,7 @@ def write_stress_npz(source: StressSource, path) -> Path:
         "schema": SCHEMA, "version": SCHEMA_VERSION, "unit": "MPa",
         "tensor_order": list(TENSOR_ORDER), "nodal_origin": data.nodal_origin,
         "provenance": _json_safe(data.provenance),
+        "tensor_completeness": data.tensor_completeness.to_dict(),
     }
     normals = mesh.element_normals if mesh.element_normals is not None else np.zeros((0, 3))
     np.savez_compressed(
@@ -90,6 +92,12 @@ def read_stress_npz(path) -> ArrayStressSource:
                 raise InputError(f"{target.name} is not an ANYfatigue stress file")
             if int(meta.get("version", 0)) > SCHEMA_VERSION:
                 raise InputError(f"{target.name} was written by a newer ANYfatigue")
+            if meta.get("unit") != "MPa" or tuple(meta.get("tensor_order", ())) != TENSOR_ORDER:
+                raise InputError("stress file must declare MPa and tensor order xx yy zz xy yz xz")
+            declaration = (TensorCompleteness.from_dict(meta["tensor_completeness"])
+                           if "tensor_completeness" in meta else TensorCompleteness())
+            if int(meta.get("version", 0)) >= 2 and "tensor_completeness" not in meta:
+                raise InputError("version 2 stress file is missing tensor completeness")
             normals = archive["element_normals"]
             mesh = SurfaceMesh(
                 archive["node_ids"], archive["node_xyz"], archive["element_ids"],
@@ -103,6 +111,7 @@ def read_stress_npz(path) -> ArrayStressSource:
                 node_top=archive["node_top"], node_bottom=archive["node_bottom"],
                 nodal_origin=meta.get("nodal_origin"),
                 provenance=dict(meta.get("provenance", {}), file=target.name),
+                tensor_completeness=declaration,
             )
     except (OSError, KeyError, ValueError) as error:
         if isinstance(error, InputError):
@@ -124,6 +133,7 @@ def source_from_history(
     labels: Optional[Sequence[str]] = None,
     bottom: Optional[np.ndarray] = None,
     provenance: Optional[dict] = None,
+    tensor_completeness: Optional[TensorCompleteness] = None,
 ) -> ArrayStressSource:
     """A one-element source from a stress history ``(n, 6)`` in MPa.
 
@@ -132,6 +142,8 @@ def source_from_history(
     increasing.
     """
 
+    if np.iscomplexobj(tensors) or np.iscomplexobj(bottom):
+        raise InputError("history must contain real time-domain stresses, not complex amplitudes")
     t = np.asarray(times, dtype=float)
     s = np.asarray(tensors, dtype=float)
     if t.ndim != 1 or t.size < 2:
@@ -156,15 +168,21 @@ def source_from_history(
         mesh, labels, s[:, None, :], b[:, None, :], times=t,
         node_top=nodal, node_bottom=nodal_b, nodal_origin="uniform history",
         provenance={"kind": "direct stress history", **(provenance or {})},
+        tensor_completeness=tensor_completeness,
     )
 
 
-def read_history_csv(path, *, scalar_component: str = "xx") -> ArrayStressSource:
+def read_history_csv(path, *, scalar_component: str = "xx",
+                     assumed_zero_components: Sequence[str] = (),
+                     assumption_basis: str = "") -> ArrayStressSource:
     """Read ``time`` plus either one ``stress`` column or tensor components.
 
     A header row is required.  Columns: ``time`` (s) and ``stress`` (MPa,
     stored as component ``scalar_component``), or any of ``xx yy zz xy yz xz``
-    (MPa; missing ones are zero).  Delimiters ``,`` ``;`` and tab are detected.
+    (MPa). Missing values are zero placeholders for legacy scalar use, NOT a
+    declaration of zero stress. Use assumed_zero_components with assumption_basis
+    to make justified zero assumptions explicit. All column axes are global.
+    Delimiters ``,`` ``;`` and tab are detected.
     """
 
     target = Path(path)
@@ -180,6 +198,8 @@ def read_history_csv(path, *, scalar_component: str = "xx") -> ArrayStressSource
     if len(rows) < 3:
         raise InputError("the history file needs a header and at least two samples")
     header = [h.strip().lower() for h in rows[0]]
+    if len(set(header)) != len(header):
+        raise InputError("history column names must not repeat")
     if "time" not in header:
         raise InputError("the history file needs a 'time' column")
     if scalar_component not in TENSOR_ORDER:
@@ -191,11 +211,13 @@ def read_history_csv(path, *, scalar_component: str = "xx") -> ArrayStressSource
             "give either a 'stress' column or tensor component columns "
             f"({', '.join(TENSOR_ORDER)}), not both and not neither"
         )
+    declaration = TensorCompleteness((scalar_component,) if has_scalar else tuple(components),
+                                      assumed_zero_components, assumption_basis)
     try:
         data = np.array([[float(x) for x in row] for row in rows[1:] if any(c.strip() for c in row)])
     except ValueError as error:
         raise InputError(f"non-numeric value in {target.name}: {error}") from None
-    if data.shape[1] != len(header):
+    if data.ndim != 2 or data.shape[1] != len(header):
         raise InputError("every row must have as many values as the header has columns")
     times = data[:, header.index("time")]
     tensors = np.zeros((len(times), 6))
@@ -204,4 +226,5 @@ def read_history_csv(path, *, scalar_component: str = "xx") -> ArrayStressSource
     else:
         for c in components:
             tensors[:, TENSOR_ORDER.index(c)] = data[:, header.index(c)]
-    return source_from_history(times, tensors, provenance={"file": target.name})
+    return source_from_history(times, tensors, provenance={"file": target.name},
+                               tensor_completeness=declaration)

@@ -39,6 +39,7 @@ import numpy as np
 from .anyfem_adapter import surface_mesh_from_anyfem
 from .errors import ExtractionError, InputError, MissingDependencyError, UnsupportedInputError
 from .model import SURFACES, TENSOR_ORDER, StressSource
+from .tensor import TensorCompleteness
 
 __all__ = ["ArtifactStressSource", "ResultInfo", "list_results", "read_result"]
 
@@ -201,6 +202,7 @@ class ArtifactStressSource(StressSource):
                 "with return_global=True (the 'global stress' output) so the stress can be "
                 "resolved against the weld"
             )
+        self.tensor_completeness = TensorCompleteness(TENSOR_ORDER)
         n_frames = int(dataset.frames.size)
         if kind == "load_case":
             names = [_text(x) for x in dataset.table("load_case_names")]
@@ -231,6 +233,7 @@ class ArtifactStressSource(StressSource):
         self._init_patch(dataset, keys, node_ids, use_patch)
         self.case_times = self._times(store, names, times)
         self.provenance = self._provenance(dataset, identity, file, directors is not None)
+        self.provenance["tensor_completeness"] = self.tensor_completeness.to_dict()
 
     # -- construction helpers -----------------------------------------------------
     @staticmethod
