@@ -14,22 +14,22 @@ What is read, and from where
   Nodes that patch recovery did not qualify, and nodes the patch table does not
   contain, take the mean of their incident element stresses; the count is in the
   provenance and in :attr:`ArtifactStressSource.nodal_origin`.
-* **Normals**: ``stress_physical_director`` when present, else the corner order.
+* **Normals**: saved physical shell directors when available, else the corner order.
 * **Mesh**: the ``meshes/*.anymesh.h5`` sidecar whose ``mesh_hash`` equals the
   result's.  Load-case results do not name their mesh sidecar, so the hash is
   the link; none or no match is an error.
-* **Load-case names**: the ``load_case_names`` table; **times**: the project's
-  ``load_cases`` (as set by ``add_load_case_series``) unless ``times`` is given.
+* **Times**: stored load-case times or the original transient frame times. Older
+  static batches can use the project's named cases or explicit block duration.
 
-Only linear-static results (a load-case batch or one static case) are supported;
-other frame kinds fail with a typed error.  The source is lazy: only the requested
-elements and nodes are read from disk, so a long series on a large model is not
-held in memory.
+Static shell results and completed linear transient histories with signed global
+surface tensors are supported. Samples are read from the artifact on demand.
 """
 
 from __future__ import annotations
 
 import json
+from concurrent.futures import CancelledError
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -40,7 +40,7 @@ from .anyfem_adapter import surface_mesh_from_anyfem
 from .errors import ExtractionError, InputError, MissingDependencyError, UnsupportedInputError
 from .model import SURFACES, TENSOR_ORDER, StressSource
 
-__all__ = ["ArtifactStressSource", "ResultInfo", "list_results", "read_result"]
+__all__ = ["ArtifactStressSource", "ResultInfo", "list_results", "read_result", "read_result_dataset"]
 
 PA_TO_MPA = 1.0e-6
 RESULT_SUFFIX = ".anyres.h5"
@@ -87,7 +87,10 @@ class ResultInfo:
 
     @property
     def usable(self) -> bool:
-        return self.has_global_stress and self.frame_kind in SUPPORTED_FRAMES
+        return self.has_global_stress and (
+            self.frame_kind in SUPPORTED_FRAMES or
+            (self.frame_kind == "time" and self.solution_type == "TransientSolution")
+        )
 
 
 def _store_for(path) -> Tuple[object, Path, Optional[Path]]:
@@ -123,8 +126,8 @@ def list_results(path) -> List[ResultInfo]:
     store, root, _file = _store_for(path)
     out: List[ResultInfo] = []
     for file in sorted((root / "results").glob(f"*{RESULT_SUFFIX}")):
+        dataset = LazyResultDataset(file)
         try:
-            dataset = LazyResultDataset(file)
             dataset.validate()
             identity = dataset.identity
             keys = set(dataset.field_keys)
@@ -141,6 +144,9 @@ def list_results(path) -> List[ResultInfo]:
             ))
         except (ArtifactError, OSError, KeyError, ValueError):
             continue                                    # an unreadable sidecar is not a result
+        finally:
+            if hasattr(dataset, "close"):
+                dataset.close()
     return sorted(out, key=lambda r: (r.created_utc, r.job_id))
 
 
@@ -175,24 +181,56 @@ def read_result(
         raise InputError(f"cannot read result {file.name}: {error}") from None
 
 
+def read_result_dataset(
+    dataset, *, times: Optional[Sequence[Optional[float]]] = None, patch: bool = True
+) -> "ArtifactStressSource":
+    """Bind a caller-owned open ANYfem result dataset to its submitted mesh.
+
+    The source borrows the dataset only while validating and reading metadata.
+    Later stress requests open the result sidecar independently, including after
+    the caller closes the dataset. The mesh is verified as for :func:`read_result`.
+    """
+    _h5py, _ArtifactStore, ArtifactError = _modules()
+    try:
+        store, root, file = _store_for(dataset.path)
+        if file is None:
+            raise InputError("the open dataset must refer to an ANYfem result sidecar")
+        return ArtifactStressSource(store, root, file, times=times, use_patch=patch, _dataset=dataset)
+    except (ArtifactError, OSError, KeyError) as error:
+        raise InputError(f"cannot read open result dataset: {error}") from None
+
+
 class ArtifactStressSource(StressSource):
     """A stress source backed by an ANYfem result sidecar (reads on demand)."""
 
-    def __init__(self, store, root: Path, file: Path, *, times=None, use_patch: bool = True) -> None:
-        h5py, _ArtifactStore, ArtifactError = _modules()
+    def __init__(self, store, root: Path, file: Path, *, times=None, use_patch: bool = True,
+                 _dataset=None) -> None:
         from anyfem.io.artifacts import LazyResultDataset
 
         self._file = file
+        if _dataset is not None:
+            self._load_metadata(_dataset, store, root, file, times, use_patch)
+            return
+
         dataset = LazyResultDataset(file)
+        try:
+            self._load_metadata(dataset, store, root, file, times, use_patch)
+        finally:
+            if hasattr(dataset, "close"):
+                dataset.close()
+
+    def _load_metadata(self, dataset, store, root, file, times, use_patch):
         dataset.validate()
-        self._dataset = dataset
         identity = dataset.identity
         kind = identity["frame_kind"]
-        if kind not in SUPPORTED_FRAMES:
+        transient = kind == "time" and dataset.metadata("provenance").get("solution_type") == "TransientSolution"
+        if kind not in SUPPORTED_FRAMES and not transient:
             raise UnsupportedInputError(
-                f"{file.name}: result frames are of kind {kind!r}; only linear-static results "
-                f"({', '.join(SUPPORTED_FRAMES)}) are supported"
+                f"{file.name}: unsupported frames {kind!r}. Select a linear-static result "
+                "or a linear transient with signed shell stresses."
             )
+        if identity.get("partial"):
+            raise UnsupportedInputError("fatigue requires a completed result history")
         keys = set(dataset.field_keys)
         missing = [_global_key(c, s) for c in TENSOR_ORDER for s in SURFACES if _global_key(c, s) not in keys]
         if missing:
@@ -201,24 +239,51 @@ class ArtifactStressSource(StressSource):
                 "with return_global=True (the 'global stress' output) so the stress can be "
                 "resolved against the weld"
             )
-        n_frames = int(dataset.frames.size)
+        frames = dataset.frames
+        n_frames = int(frames.size)
         if kind == "load_case":
             names = [_text(x) for x in dataset.table("load_case_names")]
             if len(names) != n_frames:
                 raise InputError(f"{file.name}: {len(names)} load-case names for {n_frames} frames")
+        elif transient:
+            if n_frames == 0 or not np.all(np.isfinite(frames)) or np.any(np.diff(frames) <= 0):
+                raise InputError("transient stress frames need finite, strictly increasing times")
+            if times is not None and not np.array_equal(times, frames):
+                raise InputError("use the original stored times of the transient result")
+            times = frames
+            names = [f"Step {i + 1} ({t:g} s)" for i, t in enumerate(frames)]
         else:
             names = ["static"]
         self.case_labels = tuple(names)
         self.n_frames = n_frames
+        self._frame_ids = tuple(range(n_frames))
+        self._frame_runs = (slice(0, n_frames),)
+        self._cancelled = None
 
         ids = np.asarray(dataset.table(f"{_global_key('xx', 'top')}_element_ids"), dtype=np.int64)
+        self._sample_shapes = {}
         for c in TENSOR_ORDER:
             for s in SURFACES:
+                key = _global_key(c, s)
+                field = dataset.field(key)
+                desc = field.descriptor
+                if (desc.unit != "Pa" or desc.basis != "global" or desc.recovery == "envelope"
+                        or desc.components != (f"global_{c}_{_SIDE[s]}",)
+                        or desc.location not in ("element", "integration_point")
+                        or field.shape[0] != n_frames):
+                    raise UnsupportedInputError(f"{key}: expected a signed global shell stress in Pa for every frame")
+                if transient:
+                    if not np.array_equal(desc.frames, frames):
+                        raise UnsupportedInputError(f"{key}: shell stress times differ from the stored result times")
+                spatial = desc.provenance.get("element_sample_shapes")
+                by_frame = desc.provenance.get("frame_element_sample_shapes")
+                if spatial is not None or by_frame is not None:
+                    self._sample_shapes[key] = (spatial, by_frame)
                 if not np.array_equal(np.asarray(dataset.table(f"{_global_key(c, s)}_element_ids")), ids):
                     raise InputError(f"{file.name}: surface stress fields cover different elements")
         self._element_ids = ids
 
-        mesh = self._find_mesh(store, root, identity["mesh_hash"], ArtifactError)
+        mesh = self._find_mesh(store, root, identity["mesh_hash"])
         directors = self._read_directors(dataset, keys, ids)
         surface_mesh, shells, node_ids = surface_mesh_from_anyfem(mesh, directors)
         if not np.array_equal(shells, ids):
@@ -229,12 +294,17 @@ class ArtifactStressSource(StressSource):
         self.mesh = surface_mesh
 
         self._init_patch(dataset, keys, node_ids, use_patch)
+        if kind == "load_case" and times is None and "load_case_times_s" in dataset.table_keys:
+            stored_times = np.asarray(dataset.table("load_case_times_s"), dtype=float)
+            if stored_times.shape != (n_frames,) or np.isinf(stored_times).any():
+                raise InputError("invalid saved load-case times")
+            times = [None if np.isnan(value) else value for value in stored_times]
         self.case_times = self._times(store, names, times)
         self.provenance = self._provenance(dataset, identity, file, directors is not None)
 
     # -- construction helpers -----------------------------------------------------
     @staticmethod
-    def _find_mesh(store, root: Path, mesh_hash: str, _error=None):
+    def _find_mesh(store, root: Path, mesh_hash: str):
         h5py, _s, _e = _modules()
         folder = root / "meshes"
         for sidecar in sorted(folder.glob("*.anymesh.h5")):
@@ -252,6 +322,11 @@ class ArtifactStressSource(StressSource):
 
     @staticmethod
     def _read_directors(dataset, keys, ids) -> Optional[Dict[int, np.ndarray]]:
+        if "shell_surface_directors" in dataset.table_keys:
+            directors = dataset.table("shell_surface_directors")
+            if not isinstance(directors, dict) or any(str(e) not in directors for e in ids):
+                raise UnsupportedInputError("the saved shell surface directors are incomplete")
+            return {int(e): np.asarray(directors[str(e)], dtype=float) for e in ids}
         if "stress_physical_director" not in keys:
             return None
         table = np.asarray(dataset.table("stress_physical_director_element_ids"), dtype=np.int64)
@@ -324,6 +399,35 @@ class ArtifactStressSource(StressSource):
         }
 
     # -- StressSource ----------------------------------------------------------------
+    def select_cases(self, labels: Sequence[str], *, cancelled=None) -> "ArtifactStressSource":
+        """Share the mesh and metadata, reading only the listed frames in their given order."""
+        labels = tuple(labels)
+        if labels == self.case_labels:
+            if cancelled is self._cancelled:
+                return self
+            view = copy(self)
+            view._cancelled = cancelled
+            return view
+        if not labels or len(set(labels)) != len(labels):
+            raise InputError("select one or more distinct load cases")
+        rows = tuple(self.case_index(label) for label in labels)
+        view = copy(self)
+        view._cancelled = cancelled
+        view.case_labels = labels
+        view.case_times = tuple(self.case_times[i] for i in rows)
+        view.provenance = {**self.provenance, "cases": list(labels)}
+        view.n_frames = len(rows)
+        view._frame_ids = tuple(self._frame_ids[i] for i in rows)
+        runs = []
+        start = previous = view._frame_ids[0]
+        for frame in view._frame_ids[1:]:
+            if frame != previous + 1:
+                runs.append(slice(start, previous + 1))
+                start = frame
+            previous = frame
+        view._frame_runs = (*runs, slice(start, previous + 1))
+        return view
+
     @property
     def nodal_origin(self) -> str:
         if not self._patch_ok:
@@ -332,22 +436,48 @@ class ArtifactStressSource(StressSource):
         text = "ANYfem patch recovery"
         return text + (f" (element average at {count} unqualified nodes)" if count else "")
 
-    def _read(self, key: str, index: np.ndarray, mean_last: bool) -> np.ndarray:
-        """Rows ``index`` (ascending, unique) of ``fields/key/values`` for every frame.
-
-        Few rows are read as an HDF5 selection; many rows (where per-row selection is
-        slower than a full read) are read whole and indexed in memory.
-        """
-
-        h5py, _s, _e = _modules()
-        with h5py.File(self._file, "r") as handle:
-            values = handle[f"fields/{key}/values"]
-            if len(index) > min(1000, values.shape[1] // 2):
-                block = np.asarray(values[...], dtype=float)[:, index]
+    def _read(self, handle, key: str, index: np.ndarray, mean_last: bool) -> np.ndarray:
+        """Read only the selected frames and requested entity rows from an open file."""
+        values = handle[f"fields/{key}/values"]
+        # HDF5 slices are efficient for contiguous IDs, including one picked shell.
+        width = index[-1] - index[0] + 1 if len(index) else 0
+        dense = bool(len(index) and width <= 2 * len(index))
+        rows = slice(index[0], index[-1] + 1) if dense else index
+        blocks = []
+        for run in self._frame_runs:
+            if self._cancelled is not None and self._cancelled():
+                raise CancelledError()
+            blocks.append(np.asarray(values[run, rows], dtype=float))
+        block = blocks[0] if len(blocks) == 1 else np.concatenate(blocks)
+        if dense and width != len(index):
+            block = block[:, index - index[0]]
+        if mean_last and block.ndim >= 3:
+            shapes = self._sample_shapes.get(key)
+            if shapes is None:
+                block = block.mean(axis=tuple(range(2, block.ndim)))
             else:
-                block = np.asarray(values[:, index], dtype=float)
-        if mean_last and block.ndim == 3:
-            block = block.mean(axis=2)
+                # Mixed shell formulations need not have the same number of
+                # Gauss points. Average exactly the samples the producer kept.
+                spatial, by_frame = shapes
+                means = np.empty(block.shape[:2])
+                for frame, stored_frame in enumerate(self._frame_ids):
+                    extents = spatial if by_frame is None else by_frame[str(stored_frame)]
+                    for slot, eid in enumerate(self.mesh.element_ids[index]):
+                        native = tuple(extents[str(eid)])
+                        sample_shape = block.shape[2:]
+                        # The artifact writer appends singleton axes to lower-rank
+                        # samples, including a scalar stored alongside a vector.
+                        native += (1,) * (len(sample_shape) - len(native))
+                        if len(native) != len(sample_shape) or any(
+                            type(size) is not int or not 1 <= size <= limit
+                            for size, limit in zip(native, sample_shape)
+                        ):
+                            raise ExtractionError(f"{key}: invalid sample shape for shell {eid}")
+                        region = tuple(slice(extent) for extent in native)
+                        means[frame, slot] = block[(frame, slot, *region)].mean()
+                block = means
+        if not np.isfinite(block).all():
+            raise ExtractionError(f"{key}: a requested shell stress sample is missing or non-finite")
         return block[..., 0] if block.ndim == 3 else block
 
     def element_stress(self, element_rows, surface):
@@ -355,8 +485,10 @@ class ArtifactStressSource(StressSource):
         rows = np.asarray(element_rows, dtype=np.int64)
         unique, inverse = np.unique(rows, return_inverse=True)
         out = np.empty((self.n_frames, unique.size, 6))
-        for k, component in enumerate(TENSOR_ORDER):
-            out[:, :, k] = self._read(_global_key(component, surface), unique, mean_last=True)
+        h5py, _, _ = _modules()
+        with h5py.File(self._file, "r") as handle:
+            for k, component in enumerate(TENSOR_ORDER):
+                out[:, :, k] = self._read(handle, _global_key(component, surface), unique, mean_last=True)
         return out[:, inverse, :] * PA_TO_MPA
 
     def node_stress(self, node_rows, surface):
@@ -368,8 +500,10 @@ class ArtifactStressSource(StressSource):
             wanted = self._patch_index[rows[patch_mask]]
             unique, inverse = np.unique(wanted, return_inverse=True)
             block = np.empty((self.n_frames, unique.size, 6))
-            for k, component in enumerate(TENSOR_ORDER):
-                block[:, :, k] = self._read(_patch_key(component, surface), unique, mean_last=False)
+            h5py, _, _ = _modules()
+            with h5py.File(self._file, "r") as handle:
+                for k, component in enumerate(TENSOR_ORDER):
+                    block[:, :, k] = self._read(handle, _patch_key(component, surface), unique, mean_last=False)
             result[:, patch_mask, :] = block[:, inverse, :] * PA_TO_MPA
         average = np.flatnonzero(~patch_mask)
         if average.size:

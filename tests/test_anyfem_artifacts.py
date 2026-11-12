@@ -121,6 +121,37 @@ def test_mesh_and_normals_equal_the_live_source(artifact, live):
     assert np.allclose(a.normals(), b.normals())
 
 
+def test_selected_saved_frames_read_only_the_requested_hdf5_slices(artifact, monkeypatch):
+    from concurrent.futures import CancelledError
+    import h5py
+
+    labels = ("c5", "c1", "c2")
+    expected = artifact.element_stress([0, 2], "bottom")[[5, 1, 2]]
+    expected_nodes = artifact.node_stress([0], "top")[[5, 1, 2]]
+    view = artifact.select_cases(labels)
+    assert view.mesh is artifact.mesh and view.case_times == tuple(TIMES[i] for i in (5, 1, 2))
+    assert view.select_cases(("c2",)).case_times == (TIMES[2],)
+    assert view.provenance["cases"] == list(labels)
+    reads = []
+    original = h5py.Dataset.__getitem__
+
+    def record(dataset, key):
+        if dataset.name.endswith("/values"):
+            reads.append(key)
+        return original(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", record)
+    assert view.element_stress([0, 2], "bottom") == pytest.approx(expected)
+    assert view.node_stress([0], "top") == pytest.approx(expected_nodes)
+    assert reads and all(key[0] in (slice(5, 6), slice(1, 3)) for key in reads)
+    reads.clear()
+    with pytest.raises(CancelledError):
+        view.select_cases(labels, cancelled=lambda: True).element_stress([0], "bottom")
+    assert not reads
+    with pytest.raises(InputError, match="no load case"):
+        view.select_cases(("c0",))
+
+
 def test_element_and_nodal_stress_equal_the_live_source(artifact, live):
     rows = np.arange(live.mesh.n_elements)
     nodes = np.arange(live.mesh.n_nodes)
@@ -153,6 +184,48 @@ def test_every_route_into_the_result_finds_the_same_file(saved, artifact):
         assert source.element_stress(rows, "top") == pytest.approx(artifact.element_stress(rows, "top"))
     with pytest.raises(InputError, match="no usable result"):
         read_result(path, job_id="nope")
+
+
+@pytest.mark.parametrize("patch,prepared", [(True, True), (False, False)])
+def test_borrow_open_dataset_is_lazy_and_survives_close(saved, monkeypatch, patch, prepared):
+    import gc
+    import weakref
+
+    import h5py
+    import anyfem.io.artifacts as artifacts
+    from anyfatigue.anyfem_artifacts import read_result, read_result_dataset
+
+    file = saved[3] / "deck.anyfem-data/results/job-1.anyres.h5"
+    by_path = read_result(file, patch=patch, times=TIMES)
+    dataset = artifacts.LazyResultDataset(file)
+    if prepared:
+        dataset.prepare_metadata()
+    reference = weakref.ref(dataset)
+    try:
+        with monkeypatch.context() as guard:
+            def no_second_dataset(*args, **kwargs):
+                pytest.fail("binding constructed another dataset")
+
+            getitem = h5py.Dataset.__getitem__
+            def no_stress_values(ds, key):
+                if ds.name.startswith("/fields/stress_global_") and ds.name.endswith("/values"):
+                    pytest.fail("binding read a global stress tensor")
+                return getitem(ds, key)
+
+            guard.setattr(artifacts, "LazyResultDataset", no_second_dataset)
+            guard.setattr(h5py.Dataset, "__getitem__", no_stress_values)
+            borrowed = read_result_dataset(dataset, patch=patch, times=TIMES)
+        assert len(dataset.table("load_case_names")) == len(TIMES)
+    finally:
+        dataset.close()
+    del dataset
+    gc.collect()
+    assert reference() is None
+    assert borrowed.provenance == by_path.provenance
+    assert borrowed.case_times == by_path.case_times
+    for surface in ("top", "bottom"):
+        assert borrowed.element_stress([0, 2], surface) == pytest.approx(by_path.element_stress([0, 2], surface))
+        assert borrowed.node_stress([0, 2], surface) == pytest.approx(by_path.node_stress([0, 2], surface))
 
 
 def test_fatigue_damage_from_the_artifact_equals_the_live_route(artifact, live):
@@ -219,12 +292,20 @@ def _copy_project(saved, tmp_path):
 
 
 def test_missing_mesh_sidecar_fails_closed(saved, tmp_path):
-    from anyfatigue.anyfem_artifacts import read_result
+    from anyfem.io.artifacts import LazyResultDataset
+    from anyfatigue.anyfem_artifacts import read_result, read_result_dataset
 
     copy = _copy_project(saved, tmp_path)
     shutil.rmtree(copy.with_name("deck.anyfem-data") / "meshes")
     with pytest.raises(ExtractionError, match="mesh sidecar"):
         read_result(copy)
+    dataset = LazyResultDataset(copy.with_name("deck.anyfem-data") / "results/job-1.anyres.h5")
+    try:
+        with pytest.raises(ExtractionError, match="mesh sidecar"):
+            read_result_dataset(dataset)
+        assert len(dataset.table("load_case_names")) == len(TIMES)
+    finally:
+        dataset.close()
 
 
 def test_unsupported_frame_kinds_are_refused(saved, tmp_path):
@@ -349,3 +430,38 @@ def test_a_node_flagged_unqualified_in_the_file_uses_the_element_average(saved, 
     assert not np.allclose(flagged.node_stress([row], "top"), clean.node_stress([row], "top"), atol=1e-9)
     other = row + 1                                                # neighbours keep their patch values
     assert flagged.node_stress([other], "top") == pytest.approx(clean.node_stress([other], "top"))
+
+
+def test_ragged_shell_samples_use_only_the_stored_integration_points(saved, tmp_path):
+    import json
+    import h5py
+    from anyfatigue.anyfem_artifacts import read_result
+
+    project = _copy_project(saved, tmp_path)
+    path = project.with_name("deck.anyfem-data") / "results" / "job-1.anyres.h5"
+    with h5py.File(path, "r+") as handle:
+        key = "stress_global_xx_top"
+        group = handle[f"fields/{key}"]
+        ids = np.asarray(handle[f"tables/{key}_element_ids"])
+        values = group["values"]
+        frames, _, samples = values.shape
+        assert samples >= 2
+        shapes = {str(int(eid)): [samples] for eid in ids}
+        shapes[str(int(ids[0]))] = []  # Scalar among vectors, padded by the producer.
+        provenance = json.loads(group.attrs["provenance"])
+        provenance["frame_element_sample_shapes"] = {str(i): dict(shapes) for i in range(frames)}
+        provenance["frame_element_sample_shapes"]["1"][str(int(ids[0]))] = [2]
+        group.attrs["provenance"] = json.dumps(provenance)
+        values[:, 0, 0] = -10.e6
+        values[:, 0, 1:] = np.nan
+        values[1, 0, 1] = 2.e6
+    source = read_result(path)
+    expected = np.full(frames, -10.)
+    expected[1] = -4.
+    assert np.array_equal(source.element_stress([0], "top")[:, 0, 0], expected)
+    assert np.array_equal(source.select_cases(("c2", "c1")).element_stress([0], "top")[:, 0, 0],
+                          [-10., -4.])
+    with h5py.File(path, "r+") as handle:
+        handle[f"fields/{key}/values"][0, 0, 0] = np.nan
+    with pytest.raises(ExtractionError, match="non-finite"):
+        source.element_stress([0], "top")
