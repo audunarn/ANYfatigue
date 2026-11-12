@@ -22,6 +22,7 @@ _WORKSPACE = _ROOT.parent
 _SIBLINGS = (
     ("anyqats", _WORKSPACE / "ANYtimeseries"),
     ("anyfem", _WORKSPACE / "ANYfem" / "src"),
+    ("anyfesolver", _WORKSPACE / "ANYfeSolver" / "src"),
     ("anyloads", _WORKSPACE / "ANYloads" / "src"),       # a dependency of ANYfem since 0.4.x
 )
 for _module, _path in _SIBLINGS:
@@ -57,7 +58,7 @@ def _importable(name: str) -> bool:
     return True
 
 
-HAVE_ANYFEM = _importable("anyfem") and _importable("anysolver") and _importable("h5py")
+HAVE_ANYFEM = _importable("anyfem") and _importable("anyfesolver") and _importable("h5py")
 HAVE_QT = _importable("PySide6.QtWidgets")
 
 

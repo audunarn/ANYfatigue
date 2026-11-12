@@ -40,7 +40,7 @@ def saved():
     from anyfem.io.project_file import save_project
     from anyfem.io.result_artifact import write_solution_artifact
     from anyfem.solve.run import solve_linear_static_many
-    from anysolver import PatchRecoveryConfig
+    from anyfesolver import PatchRecoveryConfig
 
     work = ROOT / f".pytest_tmp_{uuid.uuid4().hex}"
     work.mkdir()
