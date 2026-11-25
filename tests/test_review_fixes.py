@@ -188,7 +188,7 @@ def test_non_real_stored_dtype_is_refused(monkeypatch):
 
 
 def test_rank_one_and_rank_three_patch_fields_are_refused():
-    for shape in ((2,), (2, 3, 6)):
+    for shape in ((2,), (2, 3, 6), (2, 3, 1, 1)):
         ds = _Dataset([0.0, 1.0])
         ds.shape = shape
         with pytest.raises(UnsupportedInputError):
@@ -278,3 +278,21 @@ def test_deferred_read_wraps_missing_per_frame_sample_metadata(tmp_path):
     with h5py.File(file, "r") as handle:
         with pytest.raises(UnsupportedInputError):
             source._read(handle, "k", np.arange(4), mean_last=True)
+
+
+def test_deferred_read_refuses_changed_trailing_axes(tmp_path):
+    import h5py
+
+    source, file = reader(tmp_path, (3, 4, 1), validated=(3, 4, 2))     # Gauss points 2 -> 1
+    with h5py.File(file, "r") as handle:
+        with pytest.raises(UnsupportedInputError):
+            source._read(handle, "k", np.arange(4), mean_last=True)
+
+
+def test_patch_field_as_written_by_anyfem_has_a_trailing_unit_axis():
+    ds = _Dataset([0.0, 1.0])
+    ds.shape = (2, 3, 1)
+    init_patch(ds, None, 2)                                              # well-formed: accepted
+    ds.shape = (2, 3, 2)
+    with pytest.raises(UnsupportedInputError):
+        init_patch(ds, None, 2)

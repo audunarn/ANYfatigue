@@ -427,7 +427,9 @@ class ArtifactStressSource(StressSource):
                 desc = patch_field.descriptor
                 if desc.unit != "Pa" or desc.basis != "global":
                     raise UnsupportedInputError(f"{key}: expected a patch stress in Pa on the global basis")
-                _check_field(key, patch_field.shape, _stored_dtype(dataset, key), (2,), n_frames, ids.size)
+                _check_field(key, patch_field.shape, _stored_dtype(dataset, key), (2, 3), n_frames, ids.size)
+                if len(patch_field.shape) == 3 and int(patch_field.shape[2]) != 1:
+                    raise UnsupportedInputError(f"{key}: a patch stress needs one value per node and frame")
                 self._field_shapes[key] = tuple(int(x) for x in patch_field.shape)
                 if frames is not None and not np.array_equal(desc.frames, frames):
                     raise UnsupportedInputError(f"{key}: patch stress times differ from the stored result times")
@@ -543,6 +545,8 @@ class ArtifactStressSource(StressSource):
         expected = self._field_shapes.get(key)
         if expected is not None:
             _check_field(key, values.shape, values.dtype, (len(expected),), expected[0], expected[1])
+            if tuple(values.shape) != expected:       # trailing (Gauss/component) axes included
+                raise UnsupportedInputError(f"{key}: stored shape {tuple(values.shape)} changed from {expected}")
         elif values.dtype.kind != "f":
             raise UnsupportedInputError(f"{key}: stored values are {values.dtype}, not real floating point")
         # HDF5 slices are efficient for contiguous IDs, including one picked shell.
