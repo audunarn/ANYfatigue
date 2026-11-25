@@ -129,7 +129,7 @@ def from_solutions(
     # One global-surface recovery per case; the first also supplies the element normals.
     recoveries = [recover(shape, return_global=True) for shape in shapes]
     mesh, element_ids, node_ids = surface_mesh_from_anyfem(
-        shapes[0].built.mesh, _directors(recoveries[0])
+        shapes[0].built.mesh, _directors(recoveries[0], shapes[0])
     )
 
     element = {surface: np.zeros((len(shapes), len(element_ids), 6)) for surface in SURFACES}
@@ -200,7 +200,7 @@ def _case_time(project, name: str) -> Optional[float]:
     return None if t is None else float(t)
 
 
-def _directors(recovery) -> Dict[int, np.ndarray]:
+def _directors(recovery, shape=None) -> Dict[int, np.ndarray]:
     """``physical_director`` of every element in a recovery, as unit-length normals."""
 
     out = {}
@@ -208,6 +208,16 @@ def _directors(recovery) -> Dict[int, np.ndarray]:
         director = record.get("physical_director") if isinstance(record, dict) else None
         if director is not None:
             out[int(eid)] = np.asarray(director, dtype=float).reshape(3)
+    # Elements whose record omits it fall back to the solver element's native
+    # reference director, as the lazy path does, so eager and lazy normals agree.
+    solver_mesh = getattr(getattr(getattr(shape, "built", None), "fe_model", None), "mesh", None)
+    if solver_mesh is not None:
+        for eid in recovery.element_stresses:
+            if int(eid) in out:
+                continue
+            native = getattr(solver_mesh.elements[int(eid)], "native_reference_directors", None)
+            if native is not None:
+                out[int(eid)] = np.asarray(native(solver_mesh)[0], dtype=float).reshape(3).copy()
     return out
 
 

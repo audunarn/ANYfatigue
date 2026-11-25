@@ -174,11 +174,23 @@ def read_result(
                 + ": a result needs global surface stresses (recover with return_global=True) "
                   "from a linear-static load-case batch"
             )
-        file = usable[-1].path
-    try:
-        return ArtifactStressSource(store, root, file, times=times, use_patch=patch)
-    except (ArtifactError, OSError, KeyError) as error:
-        raise InputError(f"cannot read result {file.name}: {error}") from None
+        candidates = [r.path for r in reversed(usable)]
+        if job_id is not None:
+            candidates = candidates[:1]
+    else:
+        candidates = [file]
+    last_error = None
+    for candidate in candidates:
+        try:
+            return ArtifactStressSource(store, root, candidate, times=times, use_patch=patch)
+        except (ArtifactError, OSError, KeyError, InputError, UnsupportedInputError) as error:
+            # Newest first: an unreadable newer result must not hide an older usable one.
+            if len(candidates) == 1:
+                if isinstance(error, (InputError, UnsupportedInputError)):
+                    raise
+                raise InputError(f"cannot read result {candidate.name}: {error}") from None
+            last_error = error
+    raise InputError(f"no readable result in the project; newest failed: {last_error}") from None
 
 
 def read_result_dataset(
@@ -293,7 +305,7 @@ class ArtifactStressSource(StressSource):
             )
         self.mesh = surface_mesh
 
-        self._init_patch(dataset, keys, node_ids, use_patch)
+        self._init_patch(dataset, keys, node_ids, use_patch, frames if transient else None)
         if kind == "load_case" and times is None and "load_case_times_s" in dataset.table_keys:
             stored_times = np.asarray(dataset.table("load_case_times_s"), dtype=float)
             if stored_times.shape != (n_frames,) or np.isinf(stored_times).any():
@@ -335,7 +347,7 @@ class ArtifactStressSource(StressSource):
             return None
         return {int(e): v for e, v in zip(table, values)}
 
-    def _init_patch(self, dataset, keys, node_ids, use_patch: bool) -> None:
+    def _init_patch(self, dataset, keys, node_ids, use_patch: bool, frames=None) -> None:
         n = self.mesh.n_nodes
         self._patch_index = np.full(n, -1, dtype=np.int64)
         self._patch_ok = False
@@ -348,6 +360,13 @@ class ArtifactStressSource(StressSource):
             for s in SURFACES:
                 if not np.array_equal(np.asarray(dataset.table(f"{_patch_key(c, s)}_node_ids")), ids):
                     return                               # inconsistent: do not use patch values
+        if frames is not None:
+            for c in TENSOR_ORDER:
+                for s in SURFACES:
+                    if not np.array_equal(dataset.field(_patch_key(c, s)).descriptor.frames, frames):
+                        raise UnsupportedInputError(
+                            f"{_patch_key(c, s)}: patch stress times differ from the stored result times"
+                        )
         provenance = dataset.field(_patch_key("xx", "top")).descriptor.provenance
         self._unqualified = {int(x) for x in provenance.get("unqualified_node_ids", [])}
         position = {int(nid): i for i, nid in enumerate(ids)}
