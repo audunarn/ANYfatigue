@@ -25,7 +25,7 @@ def test_eager_directors_fall_back_to_the_native_reference_director():
 class _Dataset:
     def __init__(self, frames, n_frames=None, n_nodes=3, unit="Pa", basis="global"):
         self.frames = np.asarray(frames, float)
-        self.shape = (len(frames) if n_frames is None else n_frames, n_nodes, 3)
+        self.shape = (len(frames) if n_frames is None else n_frames, n_nodes)
         self.unit, self.basis = unit, basis
 
     def table(self, key):
@@ -96,7 +96,8 @@ def _project(monkeypatch, tmp_path, behaviours):
 
 @pytest.mark.parametrize("error", [
     UnsupportedInputError("partial result"),
-    InputError("1 load-case names for 2 frames"),
+    KeyError("missing table"),
+    OSError("truncated file"),
 ])
 def test_read_result_falls_back_to_an_older_result_on_artifact_errors(monkeypatch, tmp_path, error):
     _files, opened = _project(monkeypatch, tmp_path, ["older", error])
@@ -109,3 +110,102 @@ def test_read_result_does_not_switch_result_on_the_callers_bad_times(monkeypatch
     with pytest.raises(InputError):
         art.read_result(tmp_path, times=[1.0])
     assert opened == ["r1.anyres.h5"]
+
+
+# -- malformed artifacts: refused with a typed error, never a crash or silent value ----------
+
+class _Global:
+    """A fake result dataset that reaches the per-field checks of ArtifactStressSource."""
+
+    field_keys = None
+    table_keys = ()
+    frames = np.array([0.0, 1.0])
+    identity = {"frame_kind": "load_case", "partial": False, "mesh_hash": "h", "artifact_id": "j",
+                "created_utc": "t", "analysis_hash": "a"}
+
+    def __init__(self, names=("a", "b"), shape=(2, 3), dtype=None, unit="Pa", times=None, drop_unit=False):
+        self.names, self.shape, self.dtype, self.times = names, shape, dtype, times
+        self.unit, self.drop_unit = unit, drop_unit
+        self.field_keys = [art._global_key(c, s) for c in TENSOR_ORDER for s in SURFACES]
+        self.table_keys = () if times is None else ("load_case_times_s",)
+
+    def validate(self):
+        pass
+
+    def metadata(self, key):
+        return {}
+
+    def table(self, key):
+        if key == "load_case_names":
+            return self.names
+        if key == "load_case_times_s":
+            return self.times
+        return np.array([1, 2, 3])
+
+    def field(self, key):
+        c = key.split("global_")[1].rsplit("_", 1)[0]
+        side = key.rsplit("_", 1)[1]
+        desc = SimpleNamespace(
+            unit=self.unit, basis="global", recovery="native", components=(f"global_{c}_{side}",),
+            location="element", frames=self.frames, provenance={},
+        )
+        if self.drop_unit:
+            del desc.unit
+        return SimpleNamespace(shape=self.shape, descriptor=desc)
+
+
+def open_global(monkeypatch, dataset, dtype=None):
+    monkeypatch.setattr(art, "_modules", lambda: (None, None, OSError))
+    monkeypatch.setattr(art, "_stored_dtype", lambda ds, key: dtype, raising=False)
+    monkeypatch.setattr(ArtifactStressSource, "_find_mesh", staticmethod(lambda *a: SimpleNamespace()))
+    monkeypatch.setattr(art, "surface_mesh_from_anyfem",
+                        lambda mesh, directors: (SimpleNamespace(n_nodes=1, node_ids=np.array([1])), np.array([1, 2, 3]), np.array([1])))
+    source = ArtifactStressSource.__new__(ArtifactStressSource)
+    source._load_metadata(dataset, None, Path("."), Path("r.anyres.h5"), None, False)
+
+
+def test_a_well_formed_fake_reaches_the_end(monkeypatch):
+    open_global(monkeypatch, _Global())                 # guards the fixture itself
+
+
+@pytest.mark.parametrize("make", [
+    lambda: _Global(names=np.array("scalar")),                  # scalar load_case_names -> TypeError
+    lambda: _Global(times=np.array(["x", "y"])),                # non-numeric times -> ValueError
+    lambda: _Global(shape=(2,)),                                # rank 1
+    lambda: _Global(shape=(2, 3, 4, 5)),                        # rank 4 (global allows 2 or 3)
+    lambda: _Global(shape=(1, 3)),                              # missing frames
+    lambda: _Global(shape=(2, 1)),                              # missing entities
+    lambda: _Global(drop_unit=True),                            # missing attribute
+])
+def test_malformed_global_artifacts_are_refused_with_a_typed_error(monkeypatch, make):
+    with pytest.raises(UnsupportedInputError):
+        open_global(monkeypatch, make())
+
+
+def test_non_real_stored_dtype_is_refused(monkeypatch):
+    with pytest.raises(UnsupportedInputError):
+        open_global(monkeypatch, _Global(), dtype=np.complex128)
+
+
+def test_rank_one_and_rank_three_patch_fields_are_refused():
+    for shape in ((2,), (2, 3, 6)):
+        ds = _Dataset([0.0, 1.0])
+        ds.shape = shape
+        with pytest.raises(UnsupportedInputError):
+            init_patch(ds, None, 2)
+
+
+def test_non_finite_stored_samples_are_refused_when_read():
+    source = ArtifactStressSource.__new__(ArtifactStressSource)
+    source._frame_runs = (slice(0, 1),)
+    source._cancelled = None
+    source._sample_shapes = {}
+    handle = {"fields/k/values": np.array([[np.nan, 1.0]])}
+    with pytest.raises(art.ExtractionError):
+        source._read(handle, "k", np.array([0, 1]), mean_last=True)
+
+
+def test_read_result_names_the_last_cause_when_every_result_fails(monkeypatch, tmp_path):
+    _files, _opened = _project(monkeypatch, tmp_path, [UnsupportedInputError("old bad"), UnsupportedInputError("new bad")])
+    with pytest.raises(UnsupportedInputError, match="newest failed with UnsupportedInputError: new bad; oldest failed with UnsupportedInputError: old bad"):
+        art.read_result(tmp_path)

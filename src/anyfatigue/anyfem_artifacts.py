@@ -53,6 +53,42 @@ def _global_key(component: str, surface: str) -> str:
     return f"stress_global_{component}_{_SIDE[surface]}"
 
 
+def _artifact_failures() -> tuple:
+    """Exceptions that mean a saved artifact is malformed (never the caller's own times)."""
+
+    failures = [TypeError, ValueError, IndexError, KeyError, AttributeError, OSError, InputError]
+    try:
+        failures.append(_modules()[2])
+    except MissingDependencyError:
+        pass
+    return tuple(failures)
+
+
+def _check_field(key: str, shape, dtype, ndims: Tuple[int, ...], n_frames: int, n_entities: int) -> None:
+    """Validate rank, then shape, then dtype of a stored field before anything indexes it."""
+
+    shape = tuple(int(x) for x in shape)
+    if len(shape) not in ndims:
+        raise UnsupportedInputError(f"{key}: stored rank {len(shape)} is not one of {ndims}")
+    if shape[0] != n_frames or shape[1] != n_entities:
+        raise UnsupportedInputError(
+            f"{key}: stored shape {shape} does not cover {n_frames} frames x {n_entities} entities"
+        )
+    if dtype is not None and np.dtype(dtype).kind != "f":
+        raise UnsupportedInputError(f"{key}: stored values are {np.dtype(dtype)}, not real floating point")
+
+
+def _stored_dtype(dataset, key: str):
+    """dtype of a stored field from the file header, or None when it cannot be known."""
+
+    path = getattr(dataset, "path", None)
+    if path is None:
+        return None
+    h5py, _s, _e = _modules()
+    with h5py.File(path, "r") as handle:
+        return handle[f"fields/{key}/values"].dtype
+
+
 class _CallerTimesError(InputError):
     """The caller's explicit ``times`` do not fit the result; never falls back to another job."""
 
@@ -183,20 +219,24 @@ def read_result(
             candidates = candidates[:1]
     else:
         candidates = [file]
-    last_error = None
+    first_error = last_error = None
     for candidate in candidates:
         try:
             return ArtifactStressSource(store, root, candidate, times=times, use_patch=patch)
         except _CallerTimesError:
             raise                                  # the caller's own times never switch result
-        except (ArtifactError, OSError, KeyError, ExtractionError, InputError) as error:
-            # Newest first: an unreadable newer result must not hide an older usable one.
+        except (UnsupportedInputError, ExtractionError, ArtifactError, OSError, KeyError) as error:
+            # Newest first: an unusable newer result must not hide an older usable one.
             if len(candidates) == 1:
-                if isinstance(error, (ExtractionError, InputError)):
+                if isinstance(error, (UnsupportedInputError, ExtractionError)):
                     raise
-                raise InputError(f"cannot read result {candidate.name}: {error}") from None
+                raise UnsupportedInputError(f"cannot read result {candidate.name}: {error}") from error
+            first_error = first_error or error
             last_error = error
-    raise InputError(f"no readable result in the project; newest failed: {last_error}") from None
+    raise UnsupportedInputError(
+        f"no readable result in the project; newest failed with {type(first_error).__name__}: {first_error}; "
+        f"oldest failed with {type(last_error).__name__}: {last_error}"
+    ) from last_error
 
 
 def read_result_dataset(
@@ -238,6 +278,18 @@ class ArtifactStressSource(StressSource):
                 dataset.close()
 
     def _load_metadata(self, dataset, store, root, file, times, use_patch):
+        """Read and validate a saved artifact; any malformation is one typed refusal."""
+
+        try:
+            self._load_metadata_unchecked(dataset, store, root, file, times, use_patch)
+        except (_CallerTimesError, UnsupportedInputError, ExtractionError):
+            raise
+        except _artifact_failures() as error:
+            raise UnsupportedInputError(
+                f"{file.name}: unusable ANYfem result ({type(error).__name__}: {error})"
+            ) from error
+
+    def _load_metadata_unchecked(self, dataset, store, root, file, times, use_patch):
         dataset.validate()
         identity = dataset.identity
         kind = identity["frame_kind"]
@@ -285,10 +337,10 @@ class ArtifactStressSource(StressSource):
                 key = _global_key(c, s)
                 field = dataset.field(key)
                 desc = field.descriptor
+                _check_field(key, field.shape, _stored_dtype(dataset, key), (2, 3), n_frames, ids.size)
                 if (desc.unit != "Pa" or desc.basis != "global" or desc.recovery == "envelope"
                         or desc.components != (f"global_{c}_{_SIDE[s]}",)
-                        or desc.location not in ("element", "integration_point")
-                        or field.shape[0] != n_frames or field.shape[1] != ids.size):
+                        or desc.location not in ("element", "integration_point")):
                     raise UnsupportedInputError(f"{key}: expected a signed global shell stress in Pa for every frame")
                 if transient:
                     if not np.array_equal(desc.frames, frames):
@@ -373,8 +425,7 @@ class ArtifactStressSource(StressSource):
                 desc = patch_field.descriptor
                 if desc.unit != "Pa" or desc.basis != "global":
                     raise UnsupportedInputError(f"{key}: expected a patch stress in Pa on the global basis")
-                if (n_frames is not None and patch_field.shape[0] != n_frames) or patch_field.shape[1] != ids.size:
-                    raise UnsupportedInputError(f"{key}: stored patch stress does not cover every frame and node")
+                _check_field(key, patch_field.shape, _stored_dtype(dataset, key), (2,), n_frames, ids.size)
                 if frames is not None and not np.array_equal(desc.frames, frames):
                     raise UnsupportedInputError(f"{key}: patch stress times differ from the stored result times")
         provenance = dataset.field(_patch_key("xx", "top")).descriptor.provenance
