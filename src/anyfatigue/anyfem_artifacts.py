@@ -332,12 +332,14 @@ class ArtifactStressSource(StressSource):
 
         ids = np.asarray(dataset.table(f"{_global_key('xx', 'top')}_element_ids"), dtype=np.int64)
         self._sample_shapes = {}
+        self._field_shapes = {}
         for c in TENSOR_ORDER:
             for s in SURFACES:
                 key = _global_key(c, s)
                 field = dataset.field(key)
                 desc = field.descriptor
                 _check_field(key, field.shape, _stored_dtype(dataset, key), (2, 3), n_frames, ids.size)
+                self._field_shapes[key] = tuple(int(x) for x in field.shape)
                 if (desc.unit != "Pa" or desc.basis != "global" or desc.recovery == "envelope"
                         or desc.components != (f"global_{c}_{_SIDE[s]}",)
                         or desc.location not in ("element", "integration_point")):
@@ -426,6 +428,7 @@ class ArtifactStressSource(StressSource):
                 if desc.unit != "Pa" or desc.basis != "global":
                     raise UnsupportedInputError(f"{key}: expected a patch stress in Pa on the global basis")
                 _check_field(key, patch_field.shape, _stored_dtype(dataset, key), (2,), n_frames, ids.size)
+                self._field_shapes[key] = tuple(int(x) for x in patch_field.shape)
                 if frames is not None and not np.array_equal(desc.frames, frames):
                     raise UnsupportedInputError(f"{key}: patch stress times differ from the stored result times")
         provenance = dataset.field(_patch_key("xx", "top")).descriptor.provenance
@@ -516,9 +519,32 @@ class ArtifactStressSource(StressSource):
         text = "ANYfem patch recovery"
         return text + (f" (element average at {count} unqualified nodes)" if count else "")
 
+    def _open_file(self):
+        import h5py
+
+        try:
+            return h5py.File(self._file, "r")
+        except OSError as error:
+            raise UnsupportedInputError(f"{self._file.name}: cannot reopen the result ({error})") from error
+
     def _read(self, handle, key: str, index: np.ndarray, mean_last: bool) -> np.ndarray:
-        """Read only the selected frames and requested entity rows from an open file."""
+        """Read the selected frames and entity rows; a malformed field is a typed refusal."""
+        try:
+            return self._read_unchecked(handle, key, index, mean_last)
+        except (CancelledError, UnsupportedInputError, ExtractionError):
+            raise
+        except (OSError, KeyError, ValueError, TypeError, IndexError, AttributeError) as error:
+            raise UnsupportedInputError(
+                f"{self._file.name}: {key} cannot be read ({type(error).__name__}: {error})"
+            ) from error
+
+    def _read_unchecked(self, handle, key: str, index: np.ndarray, mean_last: bool) -> np.ndarray:
         values = handle[f"fields/{key}/values"]
+        expected = self._field_shapes.get(key)
+        if expected is not None:
+            _check_field(key, values.shape, values.dtype, (len(expected),), expected[0], expected[1])
+        elif values.dtype.kind != "f":
+            raise UnsupportedInputError(f"{key}: stored values are {values.dtype}, not real floating point")
         # HDF5 slices are efficient for contiguous IDs, including one picked shell.
         width = index[-1] - index[0] + 1 if len(index) else 0
         dense = bool(len(index) and width <= 2 * len(index))
@@ -529,6 +555,12 @@ class ArtifactStressSource(StressSource):
                 raise CancelledError()
             blocks.append(np.asarray(values[run, rows], dtype=float))
         block = blocks[0] if len(blocks) == 1 else np.concatenate(blocks)
+        wanted_rows = int(index.size)
+        wanted_frames = sum(len(range(*run.indices(expected[0] if expected else run.stop))) for run in self._frame_runs)
+        if block.ndim < 2 or block.shape[0] != wanted_frames or (
+            block.shape[1] != (width if dense else wanted_rows)
+        ):
+            raise UnsupportedInputError(f"{key}: the stored field returned {block.shape[:2]}, not the requested rows")
         if dense and width != len(index):
             block = block[:, index - index[0]]
         if mean_last and block.ndim >= 3:
@@ -565,8 +597,7 @@ class ArtifactStressSource(StressSource):
         rows = np.asarray(element_rows, dtype=np.int64)
         unique, inverse = np.unique(rows, return_inverse=True)
         out = np.empty((self.n_frames, unique.size, 6))
-        h5py, _, _ = _modules()
-        with h5py.File(self._file, "r") as handle:
+        with self._open_file() as handle:
             for k, component in enumerate(TENSOR_ORDER):
                 out[:, :, k] = self._read(handle, _global_key(component, surface), unique, mean_last=True)
         return out[:, inverse, :] * PA_TO_MPA
@@ -580,8 +611,7 @@ class ArtifactStressSource(StressSource):
             wanted = self._patch_index[rows[patch_mask]]
             unique, inverse = np.unique(wanted, return_inverse=True)
             block = np.empty((self.n_frames, unique.size, 6))
-            h5py, _, _ = _modules()
-            with h5py.File(self._file, "r") as handle:
+            with self._open_file() as handle:
                 for k, component in enumerate(TENSOR_ORDER):
                     block[:, :, k] = self._read(handle, _patch_key(component, surface), unique, mean_last=False)
             result[:, patch_mask, :] = block[:, inverse, :] * PA_TO_MPA

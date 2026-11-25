@@ -39,7 +39,7 @@ class _Dataset:
 
 
 KEYS = {_patch_key(c, s) for c in TENSOR_ORDER for s in SURFACES}
-FAKE = SimpleNamespace(mesh=SimpleNamespace(n_nodes=3, node_ids=np.array([1, 2, 3])))
+FAKE = SimpleNamespace(mesh=SimpleNamespace(n_nodes=3, node_ids=np.array([1, 2, 3])), _field_shapes={})
 
 
 def init_patch(dataset, frames, n_frames):
@@ -198,6 +198,8 @@ def test_rank_one_and_rank_three_patch_fields_are_refused():
 def test_non_finite_stored_samples_are_refused_when_read():
     source = ArtifactStressSource.__new__(ArtifactStressSource)
     source._frame_runs = (slice(0, 1),)
+    source._field_shapes = {}
+    source._file = Path("x.anyres.h5")
     source._cancelled = None
     source._sample_shapes = {}
     handle = {"fields/k/values": np.array([[np.nan, 1.0]])}
@@ -209,3 +211,70 @@ def test_read_result_names_the_last_cause_when_every_result_fails(monkeypatch, t
     _files, _opened = _project(monkeypatch, tmp_path, [UnsupportedInputError("old bad"), UnsupportedInputError("new bad")])
     with pytest.raises(UnsupportedInputError, match="newest failed with UnsupportedInputError: new bad; oldest failed with UnsupportedInputError: old bad"):
         art.read_result(tmp_path)
+
+
+# -- deferred read guard --------------------------------------------------------------------
+
+def reader(tmp_path, stored, validated=(3, 4), dtype=float, name="r.anyres.h5"):
+    import h5py
+
+    file = tmp_path / name
+    with h5py.File(file, "w") as handle:
+        handle.create_dataset("fields/k/values", data=np.ones(stored, dtype=dtype))
+    source = ArtifactStressSource.__new__(ArtifactStressSource)
+    source._file = file
+    source._frame_runs = (slice(0, validated[0]),)
+    source._cancelled = None
+    source._sample_shapes = {}
+    source._field_shapes = {"k": tuple(validated)}
+    return source, file
+
+
+@pytest.mark.parametrize("stored,dtype", [
+    ((1, 4), float),            # truncated to one frame: used to broadcast
+    ((3, 2), float),            # fewer entities than validated
+    ((3, 4, 2, 2), float),      # rank changed
+    ((3, 4), complex),          # not real floating point
+    ((3, 4), np.int32),
+])
+def test_deferred_read_refuses_a_field_that_changed_since_open(tmp_path, stored, dtype):
+    import h5py
+
+    source, file = reader(tmp_path, stored, dtype=dtype)
+    with h5py.File(file, "r") as handle:
+        with pytest.raises(UnsupportedInputError):
+            source._read(handle, "k", np.arange(4), mean_last=True)
+
+
+def test_deferred_read_of_a_well_formed_field_is_unchanged(tmp_path):
+    import h5py
+
+    source, file = reader(tmp_path, (3, 4))
+    with h5py.File(file, "r") as handle:
+        assert source._read(handle, "k", np.array([0, 2]), mean_last=True).shape == (3, 2)
+        assert source._read(handle, "k", np.array([1, 2, 3]), mean_last=True).shape == (3, 3)
+
+
+def test_deferred_read_wraps_missing_dataset_and_unreadable_files(tmp_path):
+    import h5py
+
+    source, file = reader(tmp_path, (3, 4))
+    with h5py.File(file, "r") as handle:
+        with pytest.raises(UnsupportedInputError):
+            source._read(handle, "absent", np.arange(2), mean_last=True)
+    source._file = tmp_path / "gone.anyres.h5"
+    source.n_frames = 3
+    with pytest.raises(UnsupportedInputError):
+        source.element_stress(np.array([0]), "top")
+
+
+def test_deferred_read_wraps_missing_per_frame_sample_metadata(tmp_path):
+    import h5py
+
+    source, file = reader(tmp_path, (3, 4, 2), validated=(3, 4, 2))
+    source._sample_shapes = {"k": ({}, {})}               # no entry for any frame
+    source._frame_ids = (0, 1, 2)
+    source.mesh = SimpleNamespace(element_ids=np.arange(4))
+    with h5py.File(file, "r") as handle:
+        with pytest.raises(UnsupportedInputError):
+            source._read(handle, "k", np.arange(4), mean_last=True)
