@@ -183,10 +183,12 @@ def read_result(
     for candidate in candidates:
         try:
             return ArtifactStressSource(store, root, candidate, times=times, use_patch=patch)
-        except (ArtifactError, OSError, KeyError, InputError, UnsupportedInputError) as error:
+        except InputError:
+            raise                                  # caller errors (e.g. times) never switch result
+        except (ArtifactError, OSError, KeyError, ExtractionError, UnsupportedInputError) as error:
             # Newest first: an unreadable newer result must not hide an older usable one.
             if len(candidates) == 1:
-                if isinstance(error, (InputError, UnsupportedInputError)):
+                if isinstance(error, (ExtractionError, UnsupportedInputError)):
                     raise
                 raise InputError(f"cannot read result {candidate.name}: {error}") from None
             last_error = error
@@ -363,7 +365,9 @@ class ArtifactStressSource(StressSource):
         if frames is not None:
             for c in TENSOR_ORDER:
                 for s in SURFACES:
-                    if not np.array_equal(dataset.field(_patch_key(c, s)).descriptor.frames, frames):
+                    patch_field = dataset.field(_patch_key(c, s))
+                    if (patch_field.shape[0] != len(frames)
+                            or not np.array_equal(patch_field.descriptor.frames, frames)):
                         raise UnsupportedInputError(
                             f"{_patch_key(c, s)}: patch stress times differ from the stored result times"
                         )

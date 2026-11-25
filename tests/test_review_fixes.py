@@ -23,6 +23,7 @@ def test_eager_directors_fall_back_to_the_native_reference_director():
 class _Field:
     def __init__(self, frames):
         self.descriptor = SimpleNamespace(frames=np.asarray(frames, float), provenance={})
+        self.shape = (len(frames), 3)
 
 
 class _Dataset:
@@ -42,3 +43,17 @@ def test_patch_fields_with_different_frame_times_are_refused():
     with pytest.raises(UnsupportedInputError):
         ArtifactStressSource._init_patch(fake, _Dataset([1.0, 0.0]), keys, None, True, np.array([0.0, 1.0]))
     ArtifactStressSource._init_patch(fake, _Dataset([0.0, 1.0]), keys, None, True, np.array([0.0, 1.0]))
+
+
+def test_patch_field_with_missing_stored_rows_is_refused():
+    keys = {_patch_key(c, s) for c in TENSOR_ORDER for s in SURFACES}
+    fake = SimpleNamespace(mesh=SimpleNamespace(n_nodes=3, node_ids=np.array([1, 2, 3])))
+
+    class Short(_Dataset):
+        def field(self, key):
+            f = super().field(key)
+            f.shape = (1, 3)
+            return f
+
+    with pytest.raises(UnsupportedInputError):
+        ArtifactStressSource._init_patch(fake, Short([0.0, 1.0]), keys, None, True, np.array([0.0, 1.0]))
