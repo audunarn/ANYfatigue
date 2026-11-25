@@ -53,6 +53,10 @@ def _global_key(component: str, surface: str) -> str:
     return f"stress_global_{component}_{_SIDE[surface]}"
 
 
+class _CallerTimesError(InputError):
+    """The caller's explicit ``times`` do not fit the result; never falls back to another job."""
+
+
 def _patch_key(component: str, surface: str) -> str:
     return f"stress_patch_global_{component}_{_SIDE[surface]}"
 
@@ -183,12 +187,12 @@ def read_result(
     for candidate in candidates:
         try:
             return ArtifactStressSource(store, root, candidate, times=times, use_patch=patch)
-        except InputError:
-            raise                                  # caller errors (e.g. times) never switch result
-        except (ArtifactError, OSError, KeyError, ExtractionError, UnsupportedInputError) as error:
+        except _CallerTimesError:
+            raise                                  # the caller's own times never switch result
+        except (ArtifactError, OSError, KeyError, ExtractionError, InputError) as error:
             # Newest first: an unreadable newer result must not hide an older usable one.
             if len(candidates) == 1:
-                if isinstance(error, (ExtractionError, UnsupportedInputError)):
+                if isinstance(error, (ExtractionError, InputError)):
                     raise
                 raise InputError(f"cannot read result {candidate.name}: {error}") from None
             last_error = error
@@ -263,7 +267,7 @@ class ArtifactStressSource(StressSource):
             if n_frames == 0 or not np.all(np.isfinite(frames)) or np.any(np.diff(frames) <= 0):
                 raise InputError("transient stress frames need finite, strictly increasing times")
             if times is not None and not np.array_equal(times, frames):
-                raise InputError("use the original stored times of the transient result")
+                raise _CallerTimesError("use the original stored times of the transient result")
             times = frames
             names = [f"Step {i + 1} ({t:g} s)" for i, t in enumerate(frames)]
         else:
@@ -284,7 +288,7 @@ class ArtifactStressSource(StressSource):
                 if (desc.unit != "Pa" or desc.basis != "global" or desc.recovery == "envelope"
                         or desc.components != (f"global_{c}_{_SIDE[s]}",)
                         or desc.location not in ("element", "integration_point")
-                        or field.shape[0] != n_frames):
+                        or field.shape[0] != n_frames or field.shape[1] != ids.size):
                     raise UnsupportedInputError(f"{key}: expected a signed global shell stress in Pa for every frame")
                 if transient:
                     if not np.array_equal(desc.frames, frames):
@@ -307,7 +311,7 @@ class ArtifactStressSource(StressSource):
             )
         self.mesh = surface_mesh
 
-        self._init_patch(dataset, keys, node_ids, use_patch, frames if transient else None)
+        self._init_patch(dataset, keys, node_ids, use_patch, frames if transient else None, n_frames)
         if kind == "load_case" and times is None and "load_case_times_s" in dataset.table_keys:
             stored_times = np.asarray(dataset.table("load_case_times_s"), dtype=float)
             if stored_times.shape != (n_frames,) or np.isinf(stored_times).any():
@@ -349,7 +353,7 @@ class ArtifactStressSource(StressSource):
             return None
         return {int(e): v for e, v in zip(table, values)}
 
-    def _init_patch(self, dataset, keys, node_ids, use_patch: bool, frames=None) -> None:
+    def _init_patch(self, dataset, keys, node_ids, use_patch: bool, frames=None, n_frames=None) -> None:
         n = self.mesh.n_nodes
         self._patch_index = np.full(n, -1, dtype=np.int64)
         self._patch_ok = False
@@ -362,15 +366,17 @@ class ArtifactStressSource(StressSource):
             for s in SURFACES:
                 if not np.array_equal(np.asarray(dataset.table(f"{_patch_key(c, s)}_node_ids")), ids):
                     return                               # inconsistent: do not use patch values
-        if frames is not None:
-            for c in TENSOR_ORDER:
-                for s in SURFACES:
-                    patch_field = dataset.field(_patch_key(c, s))
-                    if (patch_field.shape[0] != len(frames)
-                            or not np.array_equal(patch_field.descriptor.frames, frames)):
-                        raise UnsupportedInputError(
-                            f"{_patch_key(c, s)}: patch stress times differ from the stored result times"
-                        )
+        for c in TENSOR_ORDER:
+            for s in SURFACES:
+                key = _patch_key(c, s)
+                patch_field = dataset.field(key)
+                desc = patch_field.descriptor
+                if desc.unit != "Pa" or desc.basis != "global":
+                    raise UnsupportedInputError(f"{key}: expected a patch stress in Pa on the global basis")
+                if (n_frames is not None and patch_field.shape[0] != n_frames) or patch_field.shape[1] != ids.size:
+                    raise UnsupportedInputError(f"{key}: stored patch stress does not cover every frame and node")
+                if frames is not None and not np.array_equal(desc.frames, frames):
+                    raise UnsupportedInputError(f"{key}: patch stress times differ from the stored result times")
         provenance = dataset.field(_patch_key("xx", "top")).descriptor.provenance
         self._unqualified = {int(x) for x in provenance.get("unqualified_node_ids", [])}
         position = {int(nid): i for i, nid in enumerate(ids)}
@@ -383,7 +389,7 @@ class ArtifactStressSource(StressSource):
     def _times(self, store, names, times) -> Tuple[Optional[float], ...]:
         if times is not None:
             if len(times) != len(names):
-                raise InputError("one time per load case is required")
+                raise _CallerTimesError("one time per load case is required")
             return tuple(None if t is None else float(t) for t in times)
         project = getattr(store, "project_path", None)
         found: Dict[str, Optional[float]] = {}
