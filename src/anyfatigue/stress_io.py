@@ -50,6 +50,9 @@ def materialise(source: StressSource) -> ArrayStressSource:
     bot_e = source.element_stress(e_rows, "bottom")
     top_n = source.node_stress(n_rows, "top")
     bot_n = source.node_stress(n_rows, "bottom")
+    if mesh.director_provider is not None:
+        mesh = SurfaceMesh(mesh.node_ids, mesh.node_xyz, mesh.element_ids,
+                           mesh.element_corner_ids, mesh.normals())
     return ArrayStressSource(
         mesh, source.case_labels, top_e, bot_e, times=source.case_times,
         node_top=top_n, node_bottom=bot_n, nodal_origin=source.nodal_origin,

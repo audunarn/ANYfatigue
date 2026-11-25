@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -63,6 +63,7 @@ class SurfaceMesh:
     element_ids: np.ndarray
     element_corner_ids: np.ndarray
     element_normals: Optional[np.ndarray] = None
+    director_provider: Optional[Callable[[np.ndarray], np.ndarray]] = field(default=None, repr=False)
     corner_rows: np.ndarray = field(init=False, repr=False)
     _cache: dict = field(init=False, repr=False, default_factory=dict)
 
@@ -175,7 +176,20 @@ class SurfaceMesh:
     def normals(self) -> np.ndarray:
         """Element normals: those supplied by the producer, else geometric."""
 
+        if self.director_provider is not None:
+            return self.normals_for(np.arange(self.n_elements))
         return self.element_normals if self.element_normals is not None else self.geometric_normals()
+
+    def normals_for(self, element_rows: Sequence[int]) -> np.ndarray:
+        """Physical directors for these elements, preserving order and duplicates."""
+        rows = np.asarray(element_rows, dtype=int)
+        if self.director_provider is None:
+            return self.normals()[rows]
+        values = np.asarray(self.director_provider(rows), dtype=float)
+        if (values.shape != (len(rows), 3) or not np.all(np.isfinite(values))
+                or not np.all(np.linalg.norm(values, axis=1) > 0)):
+            raise ExtractionError("producer supplied an invalid physical shell director")
+        return _unit(values)
 
     def centroids(self) -> np.ndarray:
         cached = self._cache.get("centroids")
@@ -227,18 +241,21 @@ class SurfaceMesh:
         """Average normal of the elements at each node (sign-aligned)."""
 
         incident = self.incident_elements()
-        normals = self.normals()
         out = np.zeros((len(node_rows), 3))
+        if not len(node_rows):
+            return out
+        needed = np.unique(np.concatenate([incident[int(row)] for row in node_rows]))
+        normals = self.normals_for(needed)
         for i, row in enumerate(node_rows):
             elements = incident[int(row)]
             if elements.size == 0:
                 raise ExtractionError(
                     f"node {int(self.node_ids[int(row)])} belongs to no element"
                 )
-            reference = normals[elements[0]]
+            local_normals = normals[np.searchsorted(needed, elements)]
+            reference = local_normals[0]
             total = np.zeros(3)
-            for e in elements:
-                n = normals[e]
+            for n in local_normals:
                 total += n if float(n @ reference) >= 0.0 else -n
             out[i] = total
         return _unit(out)
@@ -359,12 +376,25 @@ class StressSource:
         return len(self.case_labels)
 
     def case_index(self, label: str) -> int:
-        try:
-            return self.case_labels.index(str(label))
-        except ValueError:
-            raise InputError(
-                f"no load case {label!r}; available: {', '.join(self.case_labels)}"
-            ) from None
+        labels = self.case_labels
+        name = str(label)
+        if isinstance(labels, tuple):
+            cached = self.__dict__.get("_case_lookup")
+            if cached is None or cached[0] is not labels:
+                lookup = {}
+                for row, key in enumerate(labels):
+                    lookup.setdefault(key, row)
+                cached = labels, lookup
+                self.__dict__["_case_lookup"] = cached
+            if name in cached[1]:
+                return cached[1][name]
+        else:
+            # External sources can expose an editable list.
+            try:
+                return labels.index(name)
+            except ValueError:
+                pass
+        raise InputError(f"no load case {label!r}; available: {', '.join(labels)}")
 
     def element_stress(self, element_rows: Sequence[int], surface: str) -> np.ndarray:
         raise NotImplementedError

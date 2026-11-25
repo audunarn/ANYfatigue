@@ -125,8 +125,16 @@ result must have been saved with global surface stresses (`return_global=True`);
 its mesh sidecar is found by `mesh_hash`, load-case names and times come from the
 result and the project's load cases.
 
-Linear-static recoveries only: per shell element the top and bottom surface
-tensors in **global axes** (`stresses(return_global=True)`), optionally the
+The ANYfem Results workbench can assess picked shell elements, weld lines and
+toe points using this engine. A supporting plate selection limits the sample
+search and the nodal stress recovery to that plate. Shared junction nodes use
+an average of its incident element stresses on the chosen physical surface.
+The preview exposes the sample positions used in the extrapolation.
+
+Accepted sources include linear-static shell cases and completed linear
+transients with full displacement frames or saved signed global surface
+stresses at every stored time. The adapter reads top and bottom shell surface
+tensors in **global axes** (`return_global=True`), optionally the
 patch-recovered nodal stresses, the corner nodes and each element's
 `physical_director` as its normal. Pa becomes MPa (x 1e-6); the element value is
 the mean over integration points; a node that patch recovery did not qualify

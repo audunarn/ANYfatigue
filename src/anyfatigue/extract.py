@@ -47,9 +47,11 @@ __all__ = [
     "LOCATION_TYPES",
     "PointLocation",
     "ReadOut",
+    "ReadOutStation",
     "SamplePoint",
     "extract",
     "location_from_dict",
+    "readout_preview",
 ]
 
 _READOUT_METHODS = ("direct", "hotspot_a", "hotspot_b")
@@ -166,7 +168,7 @@ class ElementLocation:
         mesh = source.mesh
         rows = [mesh.element_row(i) for i in self.element_ids]
         centroids = mesh.centroids()[rows]
-        normals = mesh.normals()[rows]
+        normals = mesh.normals_for(rows)
         points: List[SamplePoint] = []
         for surface in self.surfaces:
             stress = source.element_stress(rows, surface)
@@ -199,78 +201,95 @@ class ElementLocation:
 # ----------------------------------------------------------------------
 # interpolation
 # ----------------------------------------------------------------------
-def _interpolate(
-    source: StressSource, points: np.ndarray, surface: str, tolerance: Optional[float]
-):
-    """Nodal stress interpolated at ``points``: ``(n_cases, M, 6)``, normals, element rows."""
+def _interpolate(source, rows, weights, surface):
+    """Interpolate one batch using previously resolved element rows and weights."""
 
-    mesh = source.mesh
-    rows, weights, _distance = mesh.locate(points, tolerance)
-    corner = mesh.corner_rows[rows]
+    corner = source.mesh.corner_rows[rows]
     needed = np.unique(corner[corner >= 0])
     nodal = source.node_stress(needed, surface)
     index = np.searchsorted(needed, np.where(corner >= 0, corner, needed[0]))
-    out = np.zeros((nodal.shape[0], len(points), 6))
+    out = np.zeros((nodal.shape[0], len(rows), 6))
     for j in range(4):
         out += weights[:, j][None, :, None] * nodal[:, index[:, j], :]
-    return out, mesh.normals()[rows], rows
+    return out
 
 
-def _check_probes(
-    source: StressSource,
-    origin: np.ndarray,
-    direction: np.ndarray,
-    readout: ReadOut,
-    surface: str,
-    tolerance: Optional[float],
-    what: str,
-) -> None:
-    """Raise a contextual :class:`ExtractionError` if a read-out point is off the mesh.
+@dataclass(frozen=True)
+class ReadOutStation:
+    """One station on the shell mesh, with physical director and sample positions (m)."""
 
-    Used only to name the offending location after a batched read-out failed; the
-    values themselves come from :func:`_hot_spot_batch`.
-    """
+    xyz: Tuple[float, float, float]
+    normal: Tuple[float, float, float]
+    direction: Optional[Tuple[float, float, float]]
+    probes: Tuple[Tuple[float, float, float], ...]
 
-    offsets = readout.offsets_m
-    probes = np.array([origin + s * direction for s in offsets])
+
+@dataclass
+class _SamplingGeometry:
+    xyz: np.ndarray
+    normals: np.ndarray
+    welds: Sequence[Optional[np.ndarray]]
+    directions: Optional[np.ndarray]
+    probes: np.ndarray  # (number of probes per station, number of stations, 3)
+    rows: np.ndarray
+    weights: Optional[np.ndarray]  # absent for direct reads at line nodes
+
+    def tensors(self, source, surface):
+        if self.weights is None:
+            return source.node_stress(self.rows, surface)
+        values = _interpolate(source, self.rows, self.weights, surface)
+        if len(self.probes) == 2:
+            near, far = np.split(values, 2, axis=1)
+            return 1.5 * near - 0.5 * far
+        return values
+
+
+def _surface_positions(mesh, rows, weights):
+    # The fourth weight of a triangle is zero. A valid index there lets quads
+    # and triangles share the same shape-function interpolation.
+    corners = np.maximum(mesh.corner_rows[rows], 0)
+    return np.einsum("ij,ijk->ik", weights, mesh.node_xyz[corners])
+
+
+def _sampling_geometry(location, mesh, xyz, normals, welds, names, rows, weights):
+    readout = location.readout
+    station_xyz = xyz if weights is None else _surface_positions(mesh, rows, weights)
+    if readout.method == "direct":
+        return _SamplingGeometry(station_xyz, normals, welds, None, station_xyz[None, :, :],
+                                 rows, weights)
+
+    directions = []
+    for normal, weld, name in zip(normals, welds, names):
+        if readout.direction is not None:
+            direction = _project(readout.direction, normal)
+        elif weld is not None:
+            direction = readout.side * np.cross(normal, weld)
+        else:
+            direction = None
+        if direction is None:
+            raise InputError(
+                f"{name}: a hot-spot read-out needs a weld direction or an "
+                "explicit read-out direction in the plate"
+            )
+        directions.append(direction / np.linalg.norm(direction))
+    directions = np.asarray(directions)
+    probes = np.array([xyz + offset * directions for offset in readout.offsets_m])
     try:
-        _interpolate(source, probes, surface, tolerance)
-    except ExtractionError as error:
-        raise ExtractionError(
-            f"{what}: read-out points at {', '.join(f'{s * 1000:g} mm' for s in offsets)} "
-            f"from the weld toe are not on the mesh ({error})"
-        ) from None
-
-
-def _hot_spot_batch(
-    source: StressSource,
-    origins: np.ndarray,
-    directions: np.ndarray,
-    readout: ReadOut,
-    surface: str,
-    tolerance: Optional[float],
-    names: Sequence[str],
-) -> np.ndarray:
-    """Hot-spot tensors for many origins with one interpolation call.
-
-    One call matters for sources that read from disk: the nodal field is fetched
-    once for all read-out points instead of once per point.  On failure the
-    points are retried one by one so the error names the offending location.
-    """
-
-    offsets = readout.offsets_m
-    n = len(origins)
-    probes = np.concatenate([origins + s * directions for s in offsets])
-    try:
-        values, _normals, _rows = _interpolate(source, probes, surface, tolerance)
+        rows, weights, _ = mesh.locate(probes.reshape(-1, 3), location.tolerance)
     except ExtractionError:
-        for i in range(n):
-            _check_probes(source, origins[i], directions[i], readout, surface, tolerance, names[i])
+        # Identify the offending station after a failed batch without reading stresses.
+        for i, name in enumerate(names):
+            try:
+                mesh.locate(probes[:, i], location.tolerance)
+            except ExtractionError as error:
+                distances = ", ".join(f"{s * 1000:g} mm" for s in readout.offsets_m)
+                raise ExtractionError(
+                    f"{name}: read-out points at {distances} from the weld toe "
+                    f"are not on the mesh ({error})"
+                ) from None
         raise
-    values = values.reshape(values.shape[0], len(offsets), n, 6)
-    if readout.method == "hotspot_b":
-        return values[:, 0]
-    return 1.5 * values[:, 0] - 0.5 * values[:, 1]
+    sample_xyz = _surface_positions(mesh, rows, weights).reshape(probes.shape)
+    return _SamplingGeometry(station_xyz, normals, welds, directions, sample_xyz, rows, weights)
 
 
 # ----------------------------------------------------------------------
@@ -286,6 +305,7 @@ class LineLocation:
     weld_direction: Optional[Tuple[float, float, float]] = None
     tolerance: Optional[float] = None
     name: str = "line"
+    closed: bool = False
 
     def __post_init__(self) -> None:
         ids = tuple(int(i) for i in self.node_ids)
@@ -293,17 +313,17 @@ class LineLocation:
             raise InputError("a line location needs at least one node id")
         if len(set(ids)) != len(ids):
             raise InputError("a line location must not repeat nodes")
+        if self.closed and len(ids) < 3:
+            raise InputError("a closed weld line needs at least three nodes")
         object.__setattr__(self, "node_ids", ids)
         object.__setattr__(self, "surfaces", _surfaces(self.surfaces))
         object.__setattr__(self, "weld_direction", _opt_vector(self.weld_direction))
 
-    def resolve(self, source: StressSource) -> List[SamplePoint]:
-        mesh = source.mesh
-        rows = [mesh.node_row(i) for i in self.node_ids]
+    def _geometry(self, mesh):
+        rows = np.array([mesh.node_row(i) for i in self.node_ids])
         xyz = mesh.node_xyz[rows]
         normals = mesh.node_normals(rows)
         tangents = self._tangents(xyz)
-        chainage = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))))
         weld = []
         for i in range(len(rows)):
             explicit = self.weld_direction if self.weld_direction is not None else tangents[i]
@@ -311,26 +331,24 @@ class LineLocation:
                 explicit = np.cross(normals[i], self.readout.direction)
             weld.append(None if explicit is None else _project(explicit, normals[i]))
 
+        names = [f"{self.name} node {nid}" for nid in self.node_ids]
+        return _sampling_geometry(self, mesh, xyz, normals, weld, names, rows, None)
+
+    def resolve(self, source: StressSource) -> List[SamplePoint]:
+        geometry = self._geometry(source.mesh)
+        lengths = np.linalg.norm(np.diff(geometry.xyz, axis=0), axis=1)
+        chainage = np.concatenate(([0.0], np.cumsum(lengths)))
         points: List[SamplePoint] = []
         for surface in self.surfaces:
-            if self.readout.method == "direct":
-                stress = source.node_stress(rows, surface)
-            else:
-                directions = np.array([
-                    self._readout_direction(normals[i], weld[i], i) for i in range(len(rows))
-                ])
-                stress = _hot_spot_batch(
-                    source, xyz, directions, self.readout, surface, self.tolerance,
-                    [f"{self.name} node {nid}" for nid in self.node_ids],
-                )
+            stress = geometry.tensors(source, surface)
             for i, node_id in enumerate(self.node_ids):
                 points.append(SamplePoint(
                     label=f"{self.name}: node {node_id} {surface}",
                     kind="line",
                     surface=surface,
-                    xyz=xyz[i],
-                    normal=normals[i],
-                    weld_direction=weld[i],
+                    xyz=geometry.xyz[i],
+                    normal=geometry.normals[i],
+                    weld_direction=geometry.welds[i],
                     tensors=stress[:, i, :],
                     chainage=float(chainage[i]),
                     readout=self.readout.method,
@@ -344,29 +362,16 @@ class LineLocation:
             return [None]
         out = []
         for i in range(n):
-            lo, hi = max(i - 1, 0), min(i + 1, n - 1)
+            lo, hi = ((i - 1) % n, (i + 1) % n) if self.closed else (max(i - 1, 0), min(i + 1, n - 1))
             v = xyz[hi] - xyz[lo]
             norm = np.linalg.norm(v)
             out.append(v / norm if norm > 0.0 else None)
         return out
 
-    def _readout_direction(self, normal, weld, i) -> np.ndarray:
-        if self.readout.direction is not None:
-            d = _project(self.readout.direction, normal)
-        elif weld is not None:
-            d = self.readout.side * np.cross(normal, weld)
-        else:
-            d = None
-        if d is None:
-            raise InputError(
-                f"{self.name}: a hot-spot read-out needs a weld direction or an "
-                f"explicit read-out direction (node {self.node_ids[i]})"
-            )
-        return d / np.linalg.norm(d)
-
     def to_dict(self) -> dict:
         return {
             "type": "line", "name": self.name, "node_ids": list(self.node_ids),
+            **({"closed": True} if self.closed else {}),
             "surfaces": list(self.surfaces), "readout": self.readout.to_dict(),
             "weld_direction": None if self.weld_direction is None else list(self.weld_direction),
             "tolerance": self.tolerance,
@@ -395,29 +400,27 @@ class PointLocation:
         object.__setattr__(self, "surfaces", _surfaces(self.surfaces))
         object.__setattr__(self, "weld_direction", _opt_vector(self.weld_direction))
 
-    def resolve(self, source: StressSource) -> List[SamplePoint]:
+    def _geometry(self, mesh):
         pts = np.asarray(self.points, dtype=float)
+        rows, weights, _ = mesh.locate(pts, self.tolerance)
+        normals = mesh.normals_for(rows)
+        welds = [self._weld(normal) for normal in normals]
+        names = [f"{self.name} point {i + 1}" for i in range(len(pts))]
+        return _sampling_geometry(self, mesh, pts, normals, welds, names, rows, weights)
+
+    def resolve(self, source: StressSource) -> List[SamplePoint]:
+        geometry = self._geometry(source.mesh)
         out: List[SamplePoint] = []
         for surface in self.surfaces:
-            if self.readout.method == "direct":
-                stress, normals, _rows = _interpolate(source, pts, surface, self.tolerance)
-            else:
-                _unused, normals, _rows = _interpolate(source, pts, surface, self.tolerance)
-                directions = np.array([
-                    self._readout_direction(normals[i], self._weld(normals[i])) for i in range(len(pts))
-                ])
-                stress = _hot_spot_batch(
-                    source, pts, directions, self.readout, surface, self.tolerance,
-                    [f"{self.name} point {i + 1}" for i in range(len(pts))],
-                )
-            for i in range(len(pts)):
+            stress = geometry.tensors(source, surface)
+            for i in range(len(geometry.xyz)):
                 out.append(SamplePoint(
                     label=f"{self.name}: point {i + 1} {surface}",
                     kind="point",
                     surface=surface,
-                    xyz=pts[i],
-                    normal=normals[i],
-                    weld_direction=self._weld(normals[i]),
+                    xyz=np.asarray(self.points[i]),
+                    normal=geometry.normals[i],
+                    weld_direction=geometry.welds[i],
                     tensors=stress[:, i, :],
                     readout=self.readout.method,
                     notes=_notes(source, self.readout),
@@ -430,20 +433,6 @@ class PointLocation:
         if self.readout.direction is not None:
             return _project(np.cross(normal, self.readout.direction), normal)
         return None
-
-    def _readout_direction(self, normal, weld) -> np.ndarray:
-        if self.readout.direction is not None:
-            d = _project(self.readout.direction, normal)
-        elif weld is not None:
-            d = self.readout.side * np.cross(normal, weld)
-        else:
-            d = None
-        if d is None:
-            raise InputError(
-                f"{self.name}: a hot-spot read-out needs a weld direction or an "
-                "explicit read-out direction"
-            )
-        return d / np.linalg.norm(d)
 
     def to_dict(self) -> dict:
         return {
@@ -460,6 +449,27 @@ def _notes(source: StressSource, readout: ReadOut) -> str:
 
 
 LOCATION_TYPES = (ElementLocation, LineLocation, PointLocation)
+
+
+def readout_preview(source: StressSource, location) -> Tuple[ReadOutStation, ...]:
+    """Resolve the same toe positions, normals and probes as extraction, without reading stress.
+
+    Each station is returned once across both surfaces. A direct read samples
+    the station itself and has no direction. Hot-spot probes are ordered by
+    increasing distance from the toe. Coordinates and offsets are in metres.
+    """
+
+    if not isinstance(location, (PointLocation, LineLocation)):
+        raise InputError("read-out preview requires a point or line location")
+    geometry = location._geometry(source.mesh)
+    return tuple(
+        ReadOutStation(
+            tuple(xyz), tuple(geometry.normals[i]),
+            None if geometry.directions is None else tuple(geometry.directions[i]),
+            tuple(tuple(probe) for probe in geometry.probes[:, i]),
+        )
+        for i, xyz in enumerate(geometry.xyz)
+    )
 
 
 def extract(source: StressSource, location) -> List[SamplePoint]:

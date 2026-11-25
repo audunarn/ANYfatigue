@@ -20,8 +20,8 @@ Conversion and reductions, all recorded in the source's ``provenance``:
   element values, and the node ids are listed in the provenance so the fallback
   is visible, never silent.
 
-Only linear-static recoveries are handled (a ``LinearBatchSolution`` or
-``LinearSolution``); a result without global surface stresses is refused.
+The producer supplies linear-static shell stresses or elastic shell stresses
+recovered from the complete displacement frames of a linear transient.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import numpy as np
 
 from .errors import ExtractionError, InputError, MissingDependencyError, UnsupportedInputError
 from .extract import ElementLocation, LineLocation, ReadOut
-from .model import SURFACES, TENSOR_ORDER, ArrayStressSource, SurfaceMesh
+from .model import SURFACES, TENSOR_ORDER, ArrayStressSource, StressSource, SurfaceMesh
 
 __all__ = [
     "element_location", "fill_unqualified_nodes", "from_solutions", "line_location",
@@ -78,18 +78,37 @@ def from_solutions(
     times: Optional[Sequence[Optional[float]]] = None,
     project=None,
     patch: bool = True,
-) -> ArrayStressSource:
-    """Build a stress source from solved ANYfem linear load cases.
+    lazy: bool = False,
+) -> StressSource:
+    """Build a stress source from solved ANYfem linear load cases or a transient history.
 
     ``solutions`` is a ``LinearBatchSolution`` (the natural result of a
     load-case series), one ``LinearSolution`` or a list of them.  ``labels``
-    default to the batch's case names.  ``times`` default to the load-case
+    default to the batch's case names. With ``lazy=True``, tensors are read on
+    demand and ``source.select_cases(labels, cancelled=...)`` restricts recovery
+    to the selected frames. An optional zero-argument cancellation predicate
+    is checked between frames. ``times`` default to the load-case
     times of ``project`` (set by ``add_load_case_series``) when given, else
     ``None``; a time-series analysis then needs ``duration_s`` on its blocks.
     """
 
     _require_anyfem()
-    shapes = _shapes(solutions)
+    from anyfem.post.results import TransientSolution
+    transient = isinstance(solutions, TransientSolution)
+    if transient:
+        from anyfem.post.fields import recover
+        if not hasattr(solutions, "elastic_stress_frames"):
+            raise UnsupportedInputError("update ANYfem to read full linear transient stress frames")
+        shapes = solutions.elastic_stress_frames()
+        if times is not None and not np.array_equal(times, solutions.times):
+            raise InputError("use the original stored times of the transient result")
+        times = tuple(map(float, solutions.times))
+        if labels is None:
+            labels = [f"Step {i + 1} ({t:g} s)" for i, t in enumerate(times)]
+    else:
+        shapes = _shapes(solutions)
+        def recover(shape, **options):
+            return shape.stresses(**options)
     if labels is None:
         names = getattr(solutions, "case_names", None)
         labels = list(names) if names is not None and len(names) == len(shapes) else [
@@ -103,10 +122,14 @@ def from_solutions(
     if len(times) != len(shapes):
         raise InputError("one time per solved load case is required")
 
+    if lazy:
+        from .live_stress import LiveStressSource
+        return LiveStressSource.from_shapes(shapes, labels, times, recover, patch, transient)
+
     # One global-surface recovery per case; the first also supplies the element normals.
-    recoveries = [shape.stresses(return_global=True) for shape in shapes]
+    recoveries = [recover(shape, return_global=True) for shape in shapes]
     mesh, element_ids, node_ids = surface_mesh_from_anyfem(
-        shapes[0].built.mesh, _directors(recoveries[0])
+        shapes[0].built.mesh, _directors(recoveries[0], shapes[0])
     )
 
     element = {surface: np.zeros((len(shapes), len(element_ids), 6)) for surface in SURFACES}
@@ -122,7 +145,7 @@ def from_solutions(
         for surface in SURFACES:
             nodal[surface] = np.zeros((len(shapes), len(node_ids), 6))
         for k, shape in enumerate(shapes):
-            recovered = shape.stresses(patch_config=PatchRecoveryConfig())
+            recovered = recover(shape, patch_config=PatchRecoveryConfig())
             bundle = getattr(recovered, "nodal_stresses", None)
             if not isinstance(bundle, dict) or "nodal" not in bundle:
                 raise UnsupportedInputError(
@@ -153,7 +176,7 @@ def from_solutions(
         origin = None
 
     provenance = {
-        "kind": "ANYfem linear static results",
+        "kind": "ANYfem linear transient history" if transient else "ANYfem linear static results",
         "producer": _versions(),
         "unit_conversion": "Pa -> MPa (x 1e-6)",
         "element_reduction": "mean over integration points",
@@ -177,7 +200,7 @@ def _case_time(project, name: str) -> Optional[float]:
     return None if t is None else float(t)
 
 
-def _directors(recovery) -> Dict[int, np.ndarray]:
+def _directors(recovery, shape=None) -> Dict[int, np.ndarray]:
     """``physical_director`` of every element in a recovery, as unit-length normals."""
 
     out = {}
@@ -185,10 +208,20 @@ def _directors(recovery) -> Dict[int, np.ndarray]:
         director = record.get("physical_director") if isinstance(record, dict) else None
         if director is not None:
             out[int(eid)] = np.asarray(director, dtype=float).reshape(3)
+    # Elements whose record omits it fall back to the solver element's native
+    # reference director, as the lazy path does, so eager and lazy normals agree.
+    solver_mesh = getattr(getattr(getattr(shape, "built", None), "fe_model", None), "mesh", None)
+    if solver_mesh is not None:
+        for eid in recovery.element_stresses:
+            if int(eid) in out:
+                continue
+            native = getattr(solver_mesh.elements[int(eid)], "native_reference_directors", None)
+            if native is not None:
+                out[int(eid)] = np.asarray(native(solver_mesh)[0], dtype=float).reshape(3).copy()
     return out
 
 
-def surface_mesh_from_anyfem(mesh, normals: Optional[Mapping[int, np.ndarray]] = None):
+def surface_mesh_from_anyfem(mesh, normals: Optional[Mapping[int, np.ndarray]] = None, *, director_provider=None):
     """Shell corner mesh from an ANYfem/ANYmesher ``Mesh``.
 
     ``normals`` maps element id to its normal (ANYfem's ``physical_director``).  If
@@ -214,6 +247,7 @@ def surface_mesh_from_anyfem(mesh, normals: Optional[Mapping[int, np.ndarray]] =
         element_normals = np.array([normals[int(e)] for e in shells])
     surface_mesh = SurfaceMesh(
         node_ids, xyz, np.array(shells, dtype=np.int64), corners, element_normals=element_normals,
+        director_provider=director_provider,
     )
     return surface_mesh, np.array(shells, dtype=np.int64), node_ids
 
